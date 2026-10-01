@@ -14,7 +14,9 @@ FOOTER = os.environ.get("FOOTER", "").strip()
 EXTRA_EXT = {e.strip().lower().lstrip(".") for e in os.environ.get("EXTRA_EXT", "").split(",") if e.strip()}
 ALLOWED_EXT = {"mcaddon", "mcpack", "mcworld", "mctemplate"} | EXTRA_EXT
 MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
-MAX_PER_RUN = 10
+MAX_PER_RUN = 10        # всего постов за один запуск
+MAX_PER_SOURCE = 3      # не больше постов с одного канала за запуск
+FIRST_RUN_HOURS = 999   # за сколько часов брать историю при первом запуске (потом верни 24)
 SETTLE_MIN = 5
 STATE = "state.json"
 BAD_WORDS = ["реклам", "erid", "промокод", "казино", "ставк", "1xbet", "заработ"]
@@ -158,7 +160,7 @@ async def main():
     state = json.load(open(STATE)) if os.path.exists(STATE) else {}
     seen = list(state.get("_seen", []))
     seen_set = set(seen)
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=999)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=FIRST_RUN_HOURS)
     sent = 0
     print("Разрешённые расширения:", sorted(ALLOWED_EXT))
     print("Источники:", len(SOURCES), "| state:", {k: v for k, v in state.items() if k != "_seen"})
@@ -172,7 +174,7 @@ async def main():
                 last = state.get(src, 0)
                 if last:
                     it = client.iter_messages(entity, min_id=last, reverse=True)
-                else:  # первый запуск: только за последние сутки
+                else:  # первый запуск: история за FIRST_RUN_HOURS часов
                     it = client.iter_messages(entity, offset_date=cutoff, reverse=True)
                 msgs = [m async for m in it]
                 if not msgs:
@@ -184,12 +186,13 @@ async def main():
                 settle = datetime.now(timezone.utc) - timedelta(minutes=SETTLE_MIN)
                 posts = build_posts(msgs)
                 print(f"  постов собрано: {len(posts)}, с файлами: {sum(1 for p in posts if p['files'])}")
+                src_sent = 0
                 for p in posts:
-                    if p["date"] > settle:
-                        print("  пост", p["first"], "слишком свежий, ждём")
+                    if sent >= MAX_PER_RUN or src_sent >= MAX_PER_SOURCE:
                         advance = p["first"] - 1
                         break
-                    if sent >= MAX_PER_RUN:
+                    if p["date"] > settle:
+                        print("  пост", p["first"], "слишком свежий, ждём")
                         advance = p["first"] - 1
                         break
                     files = [f for f in p["files"] if not any(k in seen_set for k in keys(f))]
@@ -211,6 +214,7 @@ async def main():
                             seen.append(k)
                             seen_set.add(k)
                     sent += 1
+                    src_sent += 1
                     print("Отправлено из", src, "пост", p["first"])
                     await asyncio.sleep(3)
                 state[src] = max(last, advance)
