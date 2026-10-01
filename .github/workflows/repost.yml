@@ -1,10 +1,13 @@
 name: repost
 on:
   schedule:
-    - cron: "10 19 * * *"   # 00:10 по Таджикистану
+    - cron: "*/30 * * * *"   # каждые 30 минут
   workflow_dispatch:
 permissions:
   contents: write
+concurrency:
+  group: repost
+  cancel-in-progress: false
 jobs:
   run:
     runs-on: ubuntu-latest
