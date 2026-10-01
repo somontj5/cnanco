@@ -1,4 +1,5 @@
 import os, re, json, asyncio, requests
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -32,6 +33,7 @@ PROMPT = (
 
 dead = set()
 counter = 0
+
 
 def rewrite(text):
     global counter
@@ -69,6 +71,7 @@ def rewrite(text):
         print(model, "ошибка:", r.text[:200])
     return None
 
+
 def make_caption(text):
     out = rewrite(text)
     if out is None:
@@ -77,34 +80,44 @@ def make_caption(text):
         out = out[:900] + "\n\n" + FOOTER
     return out[:1024]
 
+
 def fname(m):
     return (m.file.name or "") if m.file else ""
+
 
 def ext(m):
     return os.path.splitext(fname(m))[1].lstrip(".").lower()
 
+
 def is_file(m):
     return bool(m.document) and ext(m) in ALLOWED_EXT
 
+
 def is_preview(m):
     return bool(m.photo or m.video or m.gif)
+
 
 def bad(text):
     t = (text or "").lower()
     return any(w in t for w in BAD_WORDS)
 
+
 def keys(m):
     base = re.sub(r"[^a-z0-9а-я]", "", os.path.splitext(fname(m))[0].lower())
     return [f"d{m.document.id}", f"n{base}|{m.file.size}"]
+
 
 def new_post(m, preview, own):
     return {"text": m.message, "preview": preview, "files": [], "first": m.id,
             "last": m.id, "date": m.date, "gid": m.grouped_id, "own": own}
 
+
 def build_posts(msgs):
     posts, cur = [], None
+    skipped = 0
     for m in msgs:
         if m.fwd_from or bad(m.message):
+            skipped += 1
             cur = None
             continue
         if is_file(m):
@@ -122,10 +135,13 @@ def build_posts(msgs):
         elif m.message:
             cur = new_post(m, m if is_preview(m) else None, False)
             posts.append(cur)
+    print("  пропущено пересланных/рекламных:", skipped)
     return posts
+
 
 async def send_media(client, target, medias, caption=None):
     await client.send_file(target, medias[0] if len(medias) == 1 else medias, caption=caption)
+
 
 async def send_post(client, target, p, files, caption):
     chunks = [files[i:i + 10] for i in range(0, len(files), 10)]
@@ -137,12 +153,15 @@ async def send_post(client, target, p, files, caption):
         for i, ch in enumerate(chunks):
             await send_media(client, target, [f.media for f in ch], caption if i == 0 else None)
 
+
 async def main():
     state = json.load(open(STATE)) if os.path.exists(STATE) else {}
     seen = list(state.get("_seen", []))
     seen_set = set(seen)
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
     sent = 0
+    print("Разрешённые расширения:", sorted(ALLOWED_EXT))
+    print("Источники:", len(SOURCES), "| state:", {k: v for k, v in state.items() if k != "_seen"})
     try:
         async with TelegramClient(StringSession(SESSION), API_ID, API_HASH) as client:
             target = await client.get_entity(TARGET)
@@ -157,15 +176,25 @@ async def main():
                     it = client.iter_messages(entity, offset_date=cutoff, reverse=True)
                 msgs = [m async for m in it]
                 if not msgs:
+                    print(f"[{src}] last={last}, новых сообщений нет")
                     continue
+                exts = dict(Counter(ext(m) or "?" for m in msgs if m.document))
+                print(f"[{src}] last={last}, сообщений={len(msgs)}, файлы по расширениям={exts}")
                 advance = max(m.id for m in msgs)
                 settle = datetime.now(timezone.utc) - timedelta(minutes=SETTLE_MIN)
-                for p in build_posts(msgs):
-                    if p["date"] > settle or sent >= MAX_PER_RUN:
+                posts = build_posts(msgs)
+                print(f"  постов собрано: {len(posts)}, с файлами: {sum(1 for p in posts if p['files'])}")
+                for p in posts:
+                    if p["date"] > settle:
+                        print("  пост", p["first"], "слишком свежий, ждём")
+                        advance = p["first"] - 1
+                        break
+                    if sent >= MAX_PER_RUN:
                         advance = p["first"] - 1
                         break
                     files = [f for f in p["files"] if not any(k in seen_set for k in keys(f))]
                     if not files:
+                        print("  пропуск (дубль или нет файлов), пост", p["first"])
                         continue
                     caption = make_caption(p["text"])
                     if caption is None:
@@ -189,5 +218,6 @@ async def main():
         state["_seen"] = seen[-3000:]
         json.dump(state, open(STATE, "w"))
     print("Всего отправлено:", sent)
+
 
 asyncio.run(main())
