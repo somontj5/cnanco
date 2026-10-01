@@ -1,7 +1,7 @@
 name: repost
 on:
   schedule:
-    - cron: "*/30 * * * *"   # каждые 30 минут
+    - cron: "*/30 * * * *"
   workflow_dispatch:
 permissions:
   contents: write
@@ -22,6 +22,8 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SOURCE_CHANNELS: ${{ secrets.SOURCE_CHANNELS }}
           TARGET_CHANNEL: ${{ secrets.TARGET_CHANNEL }}
+          FOOTER: ${{ secrets.FOOTER }}
+          EXTRA_EXT: ${{ secrets.EXTRA_EXT }}
       - name: save state
         run: |
           git config user.name "bot"
