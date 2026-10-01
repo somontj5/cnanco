@@ -158,7 +158,7 @@ async def main():
     state = json.load(open(STATE)) if os.path.exists(STATE) else {}
     seen = list(state.get("_seen", []))
     seen_set = set(seen)
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=999)
     sent = 0
     print("Разрешённые расширения:", sorted(ALLOWED_EXT))
     print("Источники:", len(SOURCES), "| state:", {k: v for k, v in state.items() if k != "_seen"})
