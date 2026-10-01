@@ -1,4 +1,4 @@
-import os, json, asyncio, requests
+import os, re, json, asyncio, requests
 from datetime import datetime, timedelta, timezone
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -9,14 +9,25 @@ SESSION = os.environ["TG_SESSION"]
 SOURCES = [s.strip() for s in os.environ["SOURCE_CHANNELS"].split(",") if s.strip()]
 TARGET = os.environ["TARGET_CHANNEL"]
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
+FOOTER = os.environ.get("FOOTER", "").strip()
+EXTRA_EXT = {e.strip().lower().lstrip(".") for e in os.environ.get("EXTRA_EXT", "").split(",") if e.strip()}
+ALLOWED_EXT = {"mcaddon", "mcpack", "mcworld", "mctemplate"} | EXTRA_EXT
 MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
-MAX_PER_RUN = 15
+MAX_PER_RUN = 10
+SETTLE_MIN = 5
 STATE = "state.json"
+BAD_WORDS = ["реклам", "erid", "промокод", "казино", "ставк", "1xbet", "заработ"]
 
 PROMPT = (
-    "Перепиши это описание к посту своими словами: сохрани смысл и язык, "
-    "измени формулировки и структуру. Убери ссылки, @упоминания, названия "
-    "каналов и рекламу. Верни только готовый текст, без пояснений.\n\n"
+    "Ты редактор Telegram-канала про Minecraft Bedrock (моды, аддоны, DLC, "
+    "текстурпаки, читы). Перепиши описание поста своими словами.\n"
+    "1) Название и версию игры (например «1.21.70+») сохрани точно.\n"
+    "2) Суть и возможности переформулируй: тот же смысл, но другие слова и структура.\n"
+    "3) Убери ссылки, @упоминания, названия чужих каналов, рекламу, призывы "
+    "подписаться, слова про комментарии, навигацию и переходники.\n"
+    "4) Не больше 600 символов, 1-2 уместных эмодзи.\n"
+    "5) В конце один хэштег по типу: #аддон, #мод, #текстурпак, #шейдер, #клиент или #чит.\n"
+    "Верни только готовый текст, без пояснений и без markdown.\n\nИсходный текст:\n"
 )
 
 dead = set()
@@ -52,14 +63,84 @@ def rewrite(text):
             parts = r.json()["candidates"][0]["content"]["parts"]
             out = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
             if out:
-                return out[:1024]
+                return out
         except Exception:
             pass
         print(model, "ошибка:", r.text[:200])
     return None
 
+def make_caption(text):
+    out = rewrite(text)
+    if out is None:
+        return None
+    if FOOTER:
+        out = out[:900] + "\n\n" + FOOTER
+    return out[:1024]
+
+def fname(m):
+    return (m.file.name or "") if m.file else ""
+
+def ext(m):
+    return os.path.splitext(fname(m))[1].lstrip(".").lower()
+
+def is_file(m):
+    return bool(m.document) and ext(m) in ALLOWED_EXT
+
+def is_preview(m):
+    return bool(m.photo or m.video or m.gif)
+
+def bad(text):
+    t = (text or "").lower()
+    return any(w in t for w in BAD_WORDS)
+
+def keys(m):
+    base = re.sub(r"[^a-z0-9а-я]", "", os.path.splitext(fname(m))[0].lower())
+    return [f"d{m.document.id}", f"n{base}|{m.file.size}"]
+
+def new_post(m, preview, own):
+    return {"text": m.message, "preview": preview, "files": [], "first": m.id,
+            "last": m.id, "date": m.date, "gid": m.grouped_id, "own": own}
+
+def build_posts(msgs):
+    posts, cur = [], None
+    for m in msgs:
+        if m.fwd_from or bad(m.message):
+            cur = None
+            continue
+        if is_file(m):
+            if m.message:
+                if cur and cur["own"] and m.grouped_id and cur["gid"] == m.grouped_id:
+                    cur["files"].append(m)
+                    cur["last"], cur["date"] = m.id, m.date
+                else:
+                    cur = new_post(m, None, True)
+                    cur["files"].append(m)
+                    posts.append(cur)
+            elif cur and (m.date - cur["date"]).total_seconds() < 600:
+                cur["files"].append(m)
+                cur["last"], cur["date"] = m.id, m.date
+        elif m.message:
+            cur = new_post(m, m if is_preview(m) else None, False)
+            posts.append(cur)
+    return posts
+
+async def send_media(client, target, medias, caption=None):
+    await client.send_file(target, medias[0] if len(medias) == 1 else medias, caption=caption)
+
+async def send_post(client, target, p, files, caption):
+    chunks = [files[i:i + 10] for i in range(0, len(files), 10)]
+    if p["preview"]:
+        await send_media(client, target, [p["preview"].media], caption)
+        for ch in chunks:
+            await send_media(client, target, [f.media for f in ch])
+    else:
+        for i, ch in enumerate(chunks):
+            await send_media(client, target, [f.media for f in ch], caption if i == 0 else None)
+
 async def main():
     state = json.load(open(STATE)) if os.path.exists(STATE) else {}
+    seen = list(state.get("_seen", []))
+    seen_set = set(seen)
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
     sent = 0
     try:
@@ -77,43 +158,35 @@ async def main():
                 msgs = [m async for m in it]
                 if not msgs:
                     continue
-                max_id = max(m.id for m in msgs)
-                media = [m for m in msgs if m.video or m.audio]
-
-                groups, order = {}, []
-                for m in media:
-                    k = m.grouped_id or m.id
-                    if k not in groups:
-                        groups[k] = []
-                        order.append(k)
-                    groups[k].append(m)
-
-                stopped = False
-                for k in order:
-                    if sent >= MAX_PER_RUN:
-                        stopped = True
+                advance = max(m.id for m in msgs)
+                settle = datetime.now(timezone.utc) - timedelta(minutes=SETTLE_MIN)
+                for p in build_posts(msgs):
+                    if p["date"] > settle or sent >= MAX_PER_RUN:
+                        advance = p["first"] - 1
                         break
-                    grp = groups[k]
-                    old = next((m.message for m in grp if m.message), "")
-                    new = ""
-                    if old:
-                        new = rewrite(old)
-                        if new is None:
-                            stopped = True
-                            break
+                    files = [f for f in p["files"] if not any(k in seen_set for k in keys(f))]
+                    if not files:
+                        continue
+                    caption = make_caption(p["text"])
+                    if caption is None:
+                        advance = p["first"] - 1
+                        break
                     try:
-                        await client.send_file(target, [m.media for m in grp], caption=new or None)
+                        await send_post(client, target, p, files, caption)
                     except Exception as e:
                         print("Ошибка отправки:", e)
-                        stopped = True
+                        advance = p["first"] - 1
                         break
-                    state[src] = max(m.id for m in grp)
+                    for f in files:
+                        for k in keys(f):
+                            seen.append(k)
+                            seen_set.add(k)
                     sent += 1
-                    print("Отправлено из", src, "id", grp[0].id)
+                    print("Отправлено из", src, "пост", p["first"])
                     await asyncio.sleep(3)
-                if not stopped:
-                    state[src] = max_id
+                state[src] = max(last, advance)
     finally:
+        state["_seen"] = seen[-3000:]
         json.dump(state, open(STATE, "w"))
     print("Всего отправлено:", sent)
 
