@@ -11,31 +11,50 @@ SOURCES = [s.strip() for s in os.environ["SOURCE_CHANNELS"].split(",") if s.stri
 TARGET = os.environ["TARGET_CHANNEL"]
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 FOOTER = os.environ.get("FOOTER", "").strip()
-EXTRA_EXT = {e.strip().lower().lstrip(".") for e in os.environ.get("EXTRA_EXT", "").split(",") if e.strip()}
-ALLOWED_EXT = {"mcaddon", "mcpack", "mcworld", "mctemplate"} | EXTRA_EXT
 MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
-MAX_PER_RUN = 10          # всего постов за один запуск
-FIRST_RUN_HOURS = 9999    # история при первом запуске для нового канала (потом верни 24)
+MAX_PER_RUN = 10          # сколько постов опубликовать за один запуск
+MAX_AI_PER_RUN = 60       # сколько постов показать Gemini за один запуск (защита от слишком долгого запуска)
+FIRST_RUN_HOURS = 999     # история при первом запуске для нового канала (потом верни 24)
 SETTLE_MIN = 5            # свежие посты младше N минут ждут следующего запуска
 TARGET_SCAN = 1500        # сколько последних сообщений своего канала сканировать для защиты от дублей
 GEMINI_TRIES = 2          # попыток на каждую модель при ошибках 5xx
 MAX_FAILS = 3             # после стольких неудач Gemini пост пропускается навсегда
 STATE = "state.json"
-BAD_WORDS = ["реклам", "erid", "промокод", "казино", "ставк", "1xbet", "заработ"]
 
 PROMPT = (
-    "Ты редактор Telegram-канала про Minecraft Bedrock (моды, аддоны, DLC, "
-    "текстурпаки, читы). Перепиши описание поста своими словами.\n"
+    "Ты главный редактор Telegram-канала про Minecraft Bedrock: моды, аддоны, DLC, "
+    "текстурпаки, шейдеры, читы, клиенты, а также идеи и фото построек, скриншоты и видео. "
+    "Тебе приходит пост из чужого канала: текст (может отсутствовать), количество фото и видео "
+    "и список файлов. Сначала реши, публиковать ли его у нас.\n\n"
+    "ПУБЛИКОВАТЬ любой нормальный контент по теме: моды, аддоны, DLC, текстурпаки, шейдеры, "
+    "читы и клиенты (apk, exe и другие файлы тоже), карты, идеи и фото построек, скриншоты, "
+    "видео, обзоры, полезные новости о Minecraft. Читы и клиенты публиковать нормально, "
+    "их не нужно отсеивать как «опасные». Пост без текста, где есть только файл или только "
+    "фото, тоже можно публиковать: составь короткое описание по названию файла или по тому, "
+    "что видно из контекста, ничего не выдумывая.\n"
+    "ПРОПУСТИТЬ только если пост:\n"
+    "- реклама или продажа рекламы, услуг, ставок, казино, заработка, ботов, серверов, чужих каналов;\n"
+    "- розыгрыш, опрос или объявление канала, не связанное с контентом;\n"
+    "- вообще не про Minecraft;\n"
+    "- пустой или бессмысленный.\n"
+    "Если в хорошем посте есть рекламная строка или ссылка на чужой канал, всё равно публикуй, "
+    "а эти части убери.\n\n"
+    "Если публикуешь, напиши описание своими словами:\n"
     "1) Название и версию игры (например «1.21.70+») сохрани точно.\n"
     "2) Суть и возможности переформулируй: тот же смысл, но другие слова и структура.\n"
     "3) Убери ссылки, @упоминания, названия чужих каналов, рекламу, призывы "
     "подписаться, слова про комментарии, навигацию и переходники.\n"
     "4) Не больше 600 символов, 1-2 уместных эмодзи.\n"
-    "5) В конце один хэштег по типу: #аддон, #мод, #текстурпак, #шейдер, #клиент или #чит.\n"
-    "Формат ответа строго такой: первая строка — «НАЗВАНИЕ: » и оригинальное название "
-    "мода или аддона (как в источнике, латиницей, если оно там латиницей); "
-    "со второй строки — готовое описание. Без пояснений и без markdown.\n\n"
-    "Исходный текст:\n"
+    "5) В конце один хэштег по типу: #аддон, #мод, #текстурпак, #шейдер, #клиент, #чит, "
+    "#постройка или #новости.\n\n"
+    "Формат ответа строго такой, без пояснений и без markdown.\n"
+    "Если пропускаешь:\n"
+    "РЕШЕНИЕ: ПРОПУСТИТЬ — короткая причина\n"
+    "Если публикуешь:\n"
+    "РЕШЕНИЕ: ПУБЛИКОВАТЬ\n"
+    "НАЗВАНИЕ: оригинальное название мода, аддона или постройки (как в источнике, латиницей, "
+    "если оно там латиницей), а если названия нет, поставь прочерк\n"
+    "готовое описание (со следующей строки)\n\n"
 )
 
 dead = set()
@@ -51,7 +70,7 @@ STOP = {
 
 # ---------- Gemini ----------
 
-def call_gemini(model, text):
+def call_gemini(model, content):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     for attempt in range(1, GEMINI_TRIES + 1):
         try:
@@ -59,7 +78,7 @@ def call_gemini(model, text):
                 url,
                 headers={"x-goog-api-key": GEMINI_KEY},
                 json={
-                    "contents": [{"parts": [{"text": PROMPT + text}]}],
+                    "contents": [{"parts": [{"text": content}]}],
                     "generationConfig": {"temperature": 1.0},
                 },
                 timeout=60,
@@ -88,7 +107,7 @@ def call_gemini(model, text):
     return "fail", None
 
 
-def rewrite(text):
+def rewrite(content):
     global counter
     n = len(MODELS)
     order = MODELS[counter % n:] + MODELS[:counter % n]
@@ -96,7 +115,7 @@ def rewrite(text):
     for i, model in enumerate(order):
         if model in dead:
             continue
-        status, out = call_gemini(model, text)
+        status, out = call_gemini(model, content)
         if status == "ok":
             return "ok", out
         if status == "quota":
@@ -109,24 +128,56 @@ def rewrite(text):
 
 
 def parse_answer(out):
+    """Возвращает (решение, причина, название, описание). Решение: publish / skip / None."""
     lines = out.strip().splitlines()
-    title = None
-    if lines and lines[0].strip().upper().startswith("НАЗВАНИЕ:"):
-        title = lines[0].split(":", 1)[1].strip()
-        out = "\n".join(lines[1:]).strip()
-    return title, out
+    for idx, line in enumerate(lines):
+        u = line.strip().strip("*").upper()
+        if u.startswith("РЕШЕНИЕ"):
+            rest = line.split(":", 1)[1].strip() if ":" in line else ""
+            if "ПРОПУСТ" in u:
+                reason = ""
+                for sep in ("—", "–", "-"):
+                    if sep in rest:
+                        reason = rest.split(sep, 1)[1].strip()
+                        break
+                return "skip", reason or rest, None, ""
+            lines = lines[idx + 1:]
+            title = None
+            if lines and lines[0].strip().strip("*").upper().startswith("НАЗВАНИЕ"):
+                title = lines[0].split(":", 1)[1].strip() if ":" in lines[0] else None
+                if title in ("-", "—", "–", ""):
+                    title = None
+                lines = lines[1:]
+            return "publish", "", title, "\n".join(lines).strip()
+    return None, "", None, ""
 
 
-def make_caption(text):
-    status, out = rewrite(text)
+def build_input(p):
+    photos = sum(1 for m in p["msgs"] if m.photo)
+    videos = sum(1 for m in p["msgs"] if m.video or m.gif)
+    docs = [m for m in p["msgs"] if is_doc_file(m)]
+    names = "\n".join(f"- {fname(f)} ({(f.file.size or 0) // 1024} КБ)" for f in docs) or "нет"
+    fwd = "да" if p["fwd"] else "нет"
+    return (PROMPT + f"Пост переслан из другого канала: {fwd}\n"
+            f"Содержимое: фото {photos}, видео {videos}, файлов {len(docs)}\n"
+            f"Файлы:\n{names}\n\n"
+            f"Текст поста:\n{p['text'] or '(текста нет)'}")
+
+
+def make_caption(p):
+    """Возвращает (статус, название, описание, причина). Статусы: ok, skip, quota, fail."""
+    status, out = rewrite(build_input(p))
     if status != "ok":
-        return status, None, None
-    title, body = parse_answer(out)
-    if not body:
-        return "fail", None, None
+        return status, None, None, ""
+    decision, reason, title, body = parse_answer(out)
+    if decision == "skip":
+        return "skip", None, None, reason
+    if decision != "publish" or not body:
+        print("  ответ без понятного решения:", out[:150].replace("\n", " "))
+        return "fail", None, None, ""
     if FOOTER:
         body = body[:900] + "\n\n" + FOOTER
-    return "ok", title, body[:1024]
+    return "ok", title, body[:1024], ""
 
 
 # ---------- ключи для защиты от дублей ----------
@@ -162,11 +213,19 @@ def ext(m):
 def file_keys(m):
     name = os.path.splitext(fname(m))[0]
     base = re.sub(r"[^a-z0-9а-яё]", "", name.lower())
-    ks = [f"d{m.document.id}", f"n{base}|{m.file.size}"]
+    ks = [f"d{m.document.id}"]
+    if base:
+        ks.append(f"n{base}|{m.file.size}")
     sk = stem_key(name)
     if sk:
         ks.append(sk)
     return ks
+
+
+def item_keys(m):
+    if m.photo:
+        return [f"o{m.photo.id}"]
+    return file_keys(m)
 
 
 def text_key(text):
@@ -179,48 +238,41 @@ def text_key(text):
 
 # ---------- разбор сообщений ----------
 
-def is_file(m):
-    return bool(m.document) and ext(m) in ALLOWED_EXT
-
-
 def is_preview(m):
     return bool(m.photo or m.video or m.gif)
 
 
-def bad(text):
-    t = (text or "").lower()
-    return any(w in t for w in BAD_WORDS)
+def has_media(m):
+    if m.sticker or m.voice or m.video_note:
+        return False
+    return bool(m.photo or m.document)
 
 
-def new_post(m, preview, own):
-    return {"text": m.message, "preview": preview, "files": [], "first": m.id,
-            "last": m.id, "date": m.date, "gid": m.grouped_id, "own": own}
+def is_doc_file(m):
+    return has_media(m) and bool(m.document) and not is_preview(m)
 
 
 def build_posts(msgs):
+    """Склеивает сообщения в посты: описание, фото-альбомы, файлы под описанием."""
     posts, cur = [], None
-    skipped = 0
     for m in msgs:
-        if m.fwd_from or bad(m.message):
-            skipped += 1
-            cur = None
+        if m.action:  # служебные сообщения
             continue
-        if is_file(m):
-            if m.message:
-                if cur and cur["own"] and m.grouped_id and cur["gid"] == m.grouped_id:
-                    cur["files"].append(m)
-                    cur["last"], cur["date"] = m.id, m.date
-                else:
-                    cur = new_post(m, None, True)
-                    cur["files"].append(m)
-                    posts.append(cur)
-            elif cur and (m.date - cur["date"]).total_seconds() < 600:
-                cur["files"].append(m)
-                cur["last"], cur["date"] = m.id, m.date
-        elif m.message:
-            cur = new_post(m, m if is_preview(m) else None, False)
+        media = has_media(m)
+        if not (m.message or media):
+            continue
+        album = bool(cur and m.grouped_id and cur["gid"] == m.grouped_id)
+        tail = bool(cur and media and not m.message
+                    and (m.date - cur["date"]).total_seconds() < 600)
+        if album or tail:
+            cur["msgs"].append(m)
+            cur["last"], cur["date"] = m.id, m.date
+            if not cur["text"] and m.message:
+                cur["text"] = m.message
+        else:
+            cur = {"text": m.message or "", "msgs": [m], "first": m.id, "last": m.id,
+                   "date": m.date, "gid": m.grouped_id, "fwd": bool(m.fwd_from)}
             posts.append(cur)
-    print("  пропущено пересланных/рекламных:", skipped)
     return posts
 
 
@@ -230,15 +282,17 @@ async def send_media(client, target, medias, caption=None):
     await client.send_file(target, medias[0] if len(medias) == 1 else medias, caption=caption)
 
 
-async def send_post(client, target, p, files, caption):
-    chunks = [files[i:i + 10] for i in range(0, len(files), 10)]
-    if p["preview"]:
-        await send_media(client, target, [p["preview"].media], caption)
-        for ch in chunks:
-            await send_media(client, target, [f.media for f in ch])
-    else:
-        for i, ch in enumerate(chunks):
-            await send_media(client, target, [f.media for f in ch], caption if i == 0 else None)
+async def send_post(client, target, items, caption):
+    previews = [m for m in items if is_preview(m)]
+    files = [m for m in items if not is_preview(m)]
+    first = True
+    for group in (previews, files):  # фото и видео отдельным альбомом, файлы отдельным
+        for i in range(0, len(group), 10):
+            chunk = group[i:i + 10]
+            await send_media(client, target, [m.media for m in chunk], caption if first else None)
+            first = False
+    if first:  # медиа нет: обычный текстовый пост
+        await client.send_message(target, caption)
 
 
 def hold(pending, src, p):
@@ -255,6 +309,8 @@ async def main():
     cutoff = datetime.now(timezone.utc) - timedelta(hours=FIRST_RUN_HOURS)
     sent = 0
     dups = 0
+    skipped_ai = 0
+    ai_calls = 0
 
     def remember(ks):
         for k in ks:
@@ -262,18 +318,17 @@ async def main():
                 seen.append(k)
                 seen_set.add(k)
 
-    print("Разрешённые расширения:", sorted(ALLOWED_EXT))
     print("Источники:", len(SOURCES), "| state:",
           {k: v for k, v in state.items() if not k.startswith("_")})
     try:
         async with TelegramClient(StringSession(SESSION), API_ID, API_HASH) as client:
             target = await client.get_entity(TARGET)
 
-            # 1) что уже лежит в твоём канале — по этому тоже ищем дубли
+            # 1) что уже лежит в твоём канале: по этому тоже ищем дубли
             n0 = len(seen_set)
             async for m in client.iter_messages(target, limit=TARGET_SCAN):
-                if m.document and ext(m) in ALLOWED_EXT:
-                    remember(file_keys(m))
+                if has_media(m):
+                    remember(item_keys(m))
             print("Ключей из целевого канала добавлено:", len(seen_set) - n0)
 
             # 2) собираем посты со всех каналов
@@ -295,10 +350,11 @@ async def main():
                     print(f"[{src}] last={last}, новых сообщений нет")
                     continue
                 exts = dict(Counter(ext(m) or "?" for m in msgs if m.document))
-                print(f"[{src}] last={last}, сообщений={len(msgs)}, файлы по расширениям={exts}")
+                photos = sum(1 for m in msgs if m.photo)
+                print(f"[{src}] last={last}, сообщений={len(msgs)}, фото={photos}, файлы по расширениям={exts}")
                 max_ids[src] = max(m.id for m in msgs)
                 posts = build_posts(msgs)
-                print(f"  постов собрано: {len(posts)}, с файлами: {sum(1 for p in posts if p['files'])}")
+                print(f"  постов собрано: {len(posts)}")
                 for p in posts:
                     collected.append((src, p))
 
@@ -309,6 +365,7 @@ async def main():
             stop = False
 
             for src, p in collected:
+                key = f"{src}:{p['first']}"
                 tag = f"[{src} #{p['first']}]"
                 if stop:
                     hold(pending, src, p)
@@ -318,24 +375,28 @@ async def main():
                     stop = True
                     hold(pending, src, p)
                     continue
-                if sent >= MAX_PER_RUN:
+                if sent >= MAX_PER_RUN or ai_calls >= MAX_AI_PER_RUN:
                     stop = True
                     hold(pending, src, p)
                     continue
-
-                files = [f for f in p["files"] if not any(k in seen_set for k in file_keys(f))]
-                tk = text_key(p["text"])
-                if files and tk and tk in seen_set:
-                    files = []
-                if not files:
-                    if p["files"]:
-                        dups += 1
-                        print(tag, "дубль, пропускаю")
+                if f"p{key}" in seen_set:  # ИИ уже решил пропустить этот пост раньше
                     continue
 
-                print(tag, "запрос описания к Gemini")
-                status, title, caption = make_caption(p["text"])
-                key = f"{src}:{p['first']}"
+                # локальная проверка на дубли (до обращения к Gemini)
+                orig_media = any(has_media(m) for m in p["msgs"])
+                items = [m for m in p["msgs"] if has_media(m)
+                         and not any(k in seen_set for k in item_keys(m))]
+                tk = text_key(p["text"])
+                if any(is_doc_file(m) for m in p["msgs"]) and tk and tk in seen_set:
+                    items = []
+                if (orig_media and not items) or (not orig_media and tk and tk in seen_set):
+                    dups += 1
+                    print(tag, "дубль, пропускаю")
+                    continue
+
+                ai_calls += 1
+                print(tag, "запрос к Gemini")
+                status, title, caption, reason = make_caption(p)
                 if status == "quota":
                     print(tag, "лимиты обеих моделей исчерпаны, остановка до следующего запуска")
                     stop = True
@@ -344,27 +405,33 @@ async def main():
                 if status == "fail":
                     fails[key] = fails.get(key, 0) + 1
                     if fails[key] >= MAX_FAILS:
-                        print(tag, f"Gemini не ответил {MAX_FAILS} запуска, пост пропущен навсегда")
+                        print(tag, f"Gemini не справился {MAX_FAILS} запуска, пост пропущен навсегда")
                     else:
                         print(tag, f"Gemini недоступен (попытка {fails[key]}/{MAX_FAILS}), "
                                    "пост пропущен сейчас, повторю в следующий запуск")
                         hold(pending, src, p)
                     continue
+                if status == "skip":
+                    skipped_ai += 1
+                    remember([f"p{key}"])
+                    fails.pop(key, None)
+                    print(tag, "ИИ решил не публиковать:", reason or "без причины")
+                    continue
 
                 tkey = stem_key(title) if title else None
-                if tkey and tkey in seen_set:
+                if tkey and tkey in seen_set and any(is_doc_file(m) for m in items):
                     dups += 1
                     print(tag, "дубль по названию:", title)
                     continue
 
                 try:
-                    await send_post(client, target, p, files, caption)
+                    await send_post(client, target, items, caption)
                 except Exception as e:
                     print(tag, "ошибка отправки:", e)
                     hold(pending, src, p)
                     continue
 
-                remember([k for f in files for k in file_keys(f)] + [tk, tkey])
+                remember([k for m in items for k in item_keys(m)] + [tk, tkey])
                 fails.pop(key, None)
                 sent += 1
                 print(tag, "отправлено:", title or "(без названия)")
@@ -375,10 +442,10 @@ async def main():
                 adv = pending[src] - 1 if src in pending else mid
                 state[src] = max(state.get(src, 0), adv)
     finally:
-        state["_seen"] = seen[-3000:]
+        state["_seen"] = seen[-8000:]
         state["_fails"] = fails
         json.dump(state, open(STATE, "w"))
-    print(f"Всего отправлено: {sent}, дублей пропущено: {dups}")
+    print(f"Всего отправлено: {sent}, дублей: {dups}, отклонено ИИ: {skipped_ai}, запросов к ИИ: {ai_calls}")
 
 
 asyncio.run(main())
