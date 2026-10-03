@@ -93,36 +93,58 @@ def script_prompt(label, k, per_item, posts_text):
     if k > 1:
         task = (f"Сделай сценарий одного ролика-подборки: {k} поста из рубрики «{label}». "
                 "Ролик показывает все по очереди.")
+        hook_example = "«Три аддона, после которых выживание не будет прежним», «Эти аддоны ломают правила игры»"
     else:
         task = f"Сделай сценарий ролика про один пост из рубрики «{label}»."
+        hook_example = "«Этот мод превращает выживание в RPG»"
     return (
-        "Ты автор вирусных Shorts про Minecraft Bedrock. Цель: чтобы зритель захотел СРАЗУ скачать и "
-        f"попробовать. {task} Используй только факты из текстов постов, ничего не выдумывай, "
-        "но подавай ярко и конкретно.\n\n"
-        "ПРАВИЛА:\n"
-        "1. hook: самая первая фраза ролика, до 9 слов, про ВСЮ подборку: интрига, вопрос или "
-        "неожиданный факт"
-        + (f", назови тип и число ({k}). Пример: «Три аддона, после которых выживание не будет прежним»"
-           if k > 1 else ". Пример: «Этот мод превращает выживание в RPG»")
-        + ". Не «Новый мод» и не «Смотрите».\n"
-        "2. Для каждого поста (в том же порядке, что в списке) напиши:\n"
+        "Ты опытный сценарист коротких вертикальных видео (Shorts, Reels, TikTok) про Minecraft Bedrock. "
+        "Твои ролики досматривают до конца, потому что каждая секунда даёт зрителю новую причину не "
+        f"пролистывать. Цель: чтобы зритель захотел СРАЗУ скачать и попробовать. {task} "
+        "Факты бери только из текстов постов, ничего не выдумывай, но подавай их ярко и конкретно.\n\n"
+
+        "СЦЕНАРНОЕ МАСТЕРСТВО:\n"
+        "• Зацепка (hook) работает на любопытство: обещай результат, но не раскрывай, как. "
+        "Рабочие приёмы: боль зрителя («Надоело, что ночью везде мобы?»), контраст до и после, "
+        "число плюс обещание, неожиданный факт, прямое обращение на «ты». "
+        f"Примеры уровня: {hook_example}. "
+        "Проверка: если после этой фразы хочется узнать продолжение, она годится.\n"
+        "• ЗАПРЕЩЕНЫ штампы: «полностью изменят», «изменит твой Майнкрафт», «топ», «лучшие», "
+        "«ты не поверишь», «это нужно видеть», «новые возможности», «улучшает геймплей».\n"
+        "• Конкретика вместо общих слов: один яркий образ на пункт, сильный глагол, число или название "
+        "из текста. Не «новые предметы», а «посох, который бьёт молнией по всем мобам в радиусе».\n"
+        "• Выгода игроку: каждый пункт отвечает «что я смогу делать, чего не мог раньше» "
+        "(быстрее строить, выживать, побеждать, удивлять друзей).\n"
+        "• Нарастание: в подборке каждый следующий пост подаётся эффектнее предыдущего. "
+        "Для связки используй разные короткие переходы («Второй…», «Дальше — …», «И напоследок…»), "
+        "не повторяй один и тот же.\n"
+        "• Ритм для озвучки: короткие предложения до 12 слов, разговорная речь как другу, "
+        "без канцелярита («данный», «осуществляет», «предоставляет»), не начинай соседние фразы "
+        "одним и тем же словом, не повторяй слова подряд.\n"
+        "• Последняя фраза последнего поста даёт сильный финал, призыв скачать озвучивается "
+        "отдельно, поэтому его не пиши.\n\n"
+
+        "ТРЕБОВАНИЯ К ПОЛЯМ:\n"
+        "1. hook: самая первая фраза ролика, до 9 слов, про ВСЮ подборку"
+        + (f", назови тип и число ({k})" if k > 1 else "") + ".\n"
+        "2. Для каждого поста (строго в том же порядке, что в списке) напиши:\n"
         "   name: название мода, постройки или мира, до 38 символов, без эмодзи и ссылок;\n"
-        f"   bullets: ровно {per_item} пункта по 35-65 символов. Каждый: ЧТО ИМЕННО появляется или "
-        "меняется в игре и что игрок с этого получает. Конкретно: предметы, мобы, способности, "
-        "числа из текста. ЗАПРЕЩЕНЫ пустые фразы: «улучшает геймплей», «новые возможности», "
-        "«интересные механики». Версии игры и ссылки не пиши;\n"
-        f"   voice: ровно {per_item} фразы для диктора, по одной на пункт, по 8-16 слов, живая "
-        "разговорная речь. Первая фраза поста сразу называет его и главную суть "
+        f"   bullets: ровно {per_item} пункта по 35-65 символов, коротко и конкретно: ЧТО ИМЕННО "
+        "появляется или меняется. Версии игры и ссылки не пиши;\n"
+        f"   voice: ровно {per_item} фразы для диктора, по одной на пункт, по 8-16 слов. "
+        "Первая фраза поста сразу называет его и главную суть "
         "(например: «Первый — аддон про перчатки, которые ломают блоки втрое быстрее»). "
         "Не повторяй пункт дословно, добавляй, зачем это игроку.\n"
         "3. ВАЖНО: после hook зритель сразу слышит первый пост. Не повторяй и не пересказывай hook, "
         "не начинай фразы словами «слушай», «смотри», «представь», без вступлений и приветствий.\n"
         "4. В hook и voice все иностранные слова пиши русскими буквами, как слышатся "
-        "(Minecraft = Майнкрафт, Add-On = аддон).\n\n"
+        "(Minecraft = Майнкрафт, Add-On = аддон).\n"
+        "5. yt_title: до 90 символов, цепляющий, с числом или интригой и словом Minecraft, без обмана.\n\n"
+
         "Верни ТОЛЬКО JSON без пояснений:\n"
         '{"hook": "...",\n'
         ' "items": [{"name": "...", "bullets": ["..."], "voice": ["..."]}],\n'
-        ' "yt_title": "название для YouTube до 90 символов, с Minecraft",\n'
+        ' "yt_title": "...",\n'
         ' "yt_description": "2-3 предложения: что в подборке, призыв скачать бесплатно в Telegram, '
         'ссылка в шапке канала; в конце хэштеги #Shorts #Minecraft и ещё 2-3 по теме"}\n\n'
         "Посты:\n" + posts_text
@@ -234,25 +256,64 @@ def gemini_script(posts, type_key):
 # ---------- шрифты и текст ----------
 
 _font_cache = {}
+_font_logged = set()
+
+# Автоскачивание шрифта заголовка (на GitHub Actions есть интернет). Файл сохраняется как fonts/title.ttf.
+# Чтобы сменить шрифт: подставь другую ссылку на .ttf (например с github.com/google/fonts) или
+# положи свои файлы fonts/title.ttf и fonts/text.ttf в репозиторий, тогда скачивания не будет.
+FONT_URLS = {
+    "title": "https://github.com/google/fonts/raw/main/ofl/russoone/RussoOne-Regular.ttf",
+    "text": "",   # пусто = берётся системный TEXT_FONT
+}
+FONT_FILES = {"title": "fonts/title.ttf", "text": "fonts/text.ttf"}
+
+
+def ensure_fonts():
+    os.makedirs("fonts", exist_ok=True)
+    for kind, url in FONT_URLS.items():
+        path = FONT_FILES[kind]
+        if os.path.exists(path) or not url:
+            continue
+        try:
+            r = requests.get(url, timeout=60)
+            ok = r.status_code == 200 and len(r.content) > 10000 and \
+                r.content[:4] in (b"\x00\x01\x00\x00", b"OTTO", b"true", b"ttcf")
+            if ok:
+                open(path, "wb").write(r.content)
+                print(f"  шрифт {kind}: скачан {url.rsplit('/', 1)[-1]}")
+            else:
+                print(f"  шрифт {kind}: не скачался (HTTP {r.status_code}), беру системный")
+        except Exception as e:
+            print(f"  шрифт {kind}: ошибка скачивания ({e}), беру системный")
 
 
 def get_font(kind, size):
     spec, custom = {
-        "title": (TITLE_FONT, "fonts/title.ttf"),
-        "text": (TEXT_FONT, "fonts/text.ttf"),
-        "cta": (CTA_FONT, "fonts/title.ttf"),
+        "title": (TITLE_FONT, FONT_FILES["title"]),
+        "text": (TEXT_FONT, FONT_FILES["text"]),
+        "cta": (CTA_FONT, FONT_FILES["title"]),
     }[kind]
     if os.path.exists(custom):
         path = custom
     else:
         if spec not in _font_cache:
             try:
-                out = subprocess.run(["fc-match", "-f", "%{file}", spec],
+                out = subprocess.run(["fc-match", "-f", "%{file}|%{family}", spec],
                                      capture_output=True, text=True).stdout.strip()
+                f, fam = (out.split("|", 1) + [""])[:2]
             except Exception:
-                out = ""
-            _font_cache[spec] = out if out and os.path.exists(out) else FALLBACK_FONT
+                f, fam = "", ""
+            if f and os.path.exists(f):
+                _font_cache[spec] = f
+                if spec.split(":")[0].lower() not in fam.lower():
+                    print(f"  ВНИМАНИЕ: шрифт «{spec}» не установлен, подставлен «{fam}»")
+            else:
+                _font_cache[spec] = FALLBACK_FONT
+                print(f"  ВНИМАНИЕ: шрифт «{spec}» не найден, беру DejaVu")
         path = _font_cache[spec]
+    if (kind, path) not in _font_logged:
+        _font_logged.add((kind, path))
+        print(f"  шрифт {kind}: {path}")
     try:
         return ImageFont.truetype(path, size)
     except Exception:
@@ -296,14 +357,12 @@ def make_bg(img):
     return ImageEnhance.Brightness(bg).enhance(0.40).convert("RGBA")
 
 
-def photo_box(img, bw, bh):
-    base = ImageOps.fit(img, (bw, bh), method=Image.LANCZOS).filter(ImageFilter.GaussianBlur(28))
-    base = ImageEnhance.Brightness(base).enhance(0.55)
-    fg = ImageOps.contain(img, (bw, bh), method=Image.LANCZOS)
-    base.paste(fg, ((bw - fg.size[0]) // 2, (bh - fg.size[1]) // 2))
+def photo_box(img, bw, bh, radius=32):
+    """Фото ровно по размеру рамки (форматы совпадают, поэтому лишних полей нет)."""
+    base = ImageOps.fit(img, (bw, bh), method=Image.LANCZOS).convert("RGBA")
     mask = Image.new("L", (bw, bh), 0)
-    ImageDraw.Draw(mask).rounded_rectangle((0, 0, bw, bh), radius=32, fill=255)
-    return base.convert("RGBA"), mask
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, bw, bh), radius=radius, fill=255)
+    return base, mask
 
 
 def compute_layout(title, bullets, aspect):
@@ -329,6 +388,7 @@ def compute_layout(title, bullets, aspect):
     avail = (H - SAFE_BOTTOM) - SAFE_TOP
     box_w = CW - 24
     box_h = int(max(300, min(780, box_w / aspect, avail - fixed - 16)))
+    box_w = min(box_w, int(box_h * aspect))      # рамка точно по размеру фото, без размытых полей
     stack_h = fixed + box_h + 16
     y = SAFE_TOP + max(0, (avail - stack_h) // 2)
 
@@ -408,25 +468,28 @@ def draw_scene(L, img, stage, out_png):
 
 
 def draw_hook(imgs, hook, out_png):
-    """Заставка: крупная зацепка на жёлтой плашке + фото всех постов подборки рядом."""
+    """Заставка: крупная зацепка на жёлтой плашке + фото постов друг под другом, каждое в своей рамке."""
     canvas = make_bg(imgs[0])
-    CW, PAD, GAP, TG = COLUMN_W, 44, 36, 16
+    CW, PAD, GAP, TG, FR = COLUMN_W, 44, 36, 14, 8
     X0 = (W - CW) // 2
     m = ImageDraw.Draw(canvas)
-    f, lines, size = fit_lines(m, hook.upper(), "title", 104, CW - 2 * PAD, 4, 60)
+    f, lines, size = fit_lines(m, hook.upper(), "title", 104, CW - 2 * PAD, 5, 44)
     lh = int(size * 1.2)
     plate_h = len(lines) * lh + 2 * PAD
     avail = (H - SAFE_BOTTOM) - SAFE_TOP
-    k = len(imgs)
+    room = avail - plate_h - GAP
+
     box_w = CW - 24
-    tile_w = (box_w - TG * (k - 1)) // k
-    room = avail - plate_h - GAP - 16
-    if k == 1:
-        aspect = imgs[0].size[0] / imgs[0].size[1]
-        tile_h = int(max(300, min(800, tile_w / aspect, room)))
-    else:
-        tile_h = int(max(300, min(tile_w * 1.5, room, 820)))
-    y = SAFE_TOP + max(0, (avail - (plate_h + GAP + tile_h + 16)) // 2)
+    sizes = []
+    for im in imgs:
+        ar = im.size[0] / im.size[1]
+        h = min(box_w / ar, 520 if len(imgs) > 1 else 800)
+        sizes.append([h * ar, h, ar])
+    total = sum(h + 2 * FR for _, h, _ in sizes) + TG * (len(imgs) - 1)
+    k = min(1.0, room / total)
+    sizes = [(int(w * k), int(h * k)) for w, h, _ in sizes]
+    stack_h = sum(h + 2 * FR for _, h in sizes) + TG * (len(imgs) - 1)
+    y = SAFE_TOP + max(0, (avail - (plate_h + GAP + stack_h)) // 2)
 
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     od = ImageDraw.Draw(overlay)
@@ -434,12 +497,16 @@ def draw_hook(imgs, hook, out_png):
                          outline=(0, 0, 0, 255), width=6)
     plate_y = y
     y += plate_h + GAP
-    px = (W - box_w) // 2
-    od.rounded_rectangle((px - 8, y, px + box_w + 8, y + tile_h + 16), radius=40, fill=(255, 255, 255, 235))
+    spots = []
+    for (w, h) in sizes:
+        x = (W - w) // 2
+        od.rounded_rectangle((x - FR, y, x + w + FR, y + h + 2 * FR), radius=30, fill=(255, 255, 255, 235))
+        spots.append((x, y + FR, w, h))
+        y += h + 2 * FR + TG
     canvas = Image.alpha_composite(canvas, overlay)
-    for j, im in enumerate(imgs):
-        pb, mask = photo_box(im, tile_w, tile_h)
-        canvas.paste(pb, (px + j * (tile_w + TG), y + 8), mask)
+    for im, (x, yy, w, h) in zip(imgs, spots):
+        pb, mask = photo_box(im, w, h, radius=24)
+        canvas.paste(pb, (x, yy), mask)
     d = ImageDraw.Draw(canvas)
     for i, ln in enumerate(lines):
         d.text((W // 2, plate_y + PAD + i * lh + lh // 2), ln, font=f, fill="black", anchor="mm")
@@ -718,6 +785,8 @@ async def build_short(items, hook, out):
     for ii, it in enumerate(items):
         title = f"{ii + 1}. {it['name']}" if k > 1 else it["name"]
         a = it["imgs"][0].size
+        ar0 = a[0] / a[1]    # берём только фото того же формата, что первое, иначе рамка будет некрасивой
+        it["imgs"] = [im for im in it["imgs"] if abs((im.size[0] / im.size[1]) / ar0 - 1) < 0.15]
         it["L"] = compute_layout(title, it["bullets"], a[0] / a[1])
         for bi in range(len(it["bullets"])):
             plan.append(dict(kind="bullet", item=ii, stage=bi + 1, L=it["L"],
@@ -732,9 +801,9 @@ async def build_short(items, hook, out):
     for ii in range(k):
         idxs = [i for i, s in enumerate(plan) if s["item"] == ii]
         for j, i in enumerate(idxs):
-            plan[i].update(motion=MOTIONS[ii % len(MOTIONS)], S=0.07,
+            plan[i].update(motion=MOTIONS[ii % len(MOTIONS)], S=0.04,
                            p0=j / len(idxs), p1=(j + 1) / len(idxs))
-    plan[0].update(motion="in", S=0.12, p0=0.0, p1=1.0)
+    plan[0].update(motion="in", S=0.05, p0=0.0, p1=1.0)
 
     voice_ok = VOICE_ON
     for si, s in enumerate(plan):
@@ -783,6 +852,7 @@ async def build_short(items, hook, out):
 
 async def main():
     os.makedirs(WORK, exist_ok=True)
+    ensure_fonts()
     state = json.load(open(STATE)) if os.path.exists(STATE) else {}
     used = set(state.get("used", []))
     fails = state.get("fails", {})
