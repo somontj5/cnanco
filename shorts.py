@@ -302,6 +302,42 @@ async def find_candidates(client, target, used):
             cur = None
     return [p for p in posts if p["id"] not in used and len(p["text"]) >= 20]
 
+YT_ID = os.environ.get("YT_CLIENT_ID", "").strip()
+YT_SECRET = os.environ.get("YT_CLIENT_SECRET", "").strip()
+YT_REFRESH = os.environ.get("YT_REFRESH_TOKEN", "").strip()
+YT_PRIVACY = os.environ.get("YT_PRIVACY", "").strip() or "public"   # public / unlisted / private
+
+
+def youtube_upload(path, title, description):
+    """Загружает ролик на YouTube. Возвращает ссылку или бросает исключение."""
+    r = requests.post("https://oauth2.googleapis.com/token", data={
+        "client_id": YT_ID, "client_secret": YT_SECRET,
+        "refresh_token": YT_REFRESH, "grant_type": "refresh_token"}, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(f"YouTube токен: {r.status_code} {r.text[:300]}")
+    token = r.json()["access_token"]
+    meta = {
+        "snippet": {"title": title[:100], "description": description[:4900],
+                    "categoryId": "20"},
+        "status": {"privacyStatus": YT_PRIVACY, "selfDeclaredMadeForKids": False},
+    }
+    size = os.path.getsize(path)
+    init = requests.post(
+        "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json; charset=UTF-8",
+                 "X-Upload-Content-Length": str(size),
+                 "X-Upload-Content-Type": "video/mp4"},
+        data=json.dumps(meta), timeout=60)
+    if init.status_code != 200:
+        raise RuntimeError(f"YouTube старт: {init.status_code} {init.text[:300]}")
+    with open(path, "rb") as f:
+        up = requests.put(init.headers["Location"], data=f,
+                          headers={"Content-Type": "video/mp4"}, timeout=600)
+    if up.status_code not in (200, 201):
+        raise RuntimeError(f"YouTube загрузка: {up.status_code} {up.text[:300]}")
+    return "https://youtube.com/shorts/" + up.json()["id"]
+
 
 async def main():
     os.makedirs(WORK, exist_ok=True)
@@ -347,7 +383,15 @@ async def main():
                     out = f"{WORK}/short_{p['id']}.mp4"
                     total = make_video(pngs, out)
 
-                    caption = f"НАЗВАНИЕ:\n{yt_title}\n\nОПИСАНИЕ:\n{yt_desc}"[:1024]
+                    yt_link = ""
+                    if YT_ID and YT_SECRET and YT_REFRESH:
+                        try:
+                            yt_link = youtube_upload(out, yt_title, yt_desc)
+                            print(tag, "загружено на YouTube:", yt_link)
+                        except Exception as e:
+                            print(tag, "YouTube не принял:", e)
+                    head = f"YouTube: {yt_link}\n\n" if yt_link else "Загрузи вручную:\n\n"
+                    caption = (head + f"НАЗВАНИЕ:\n{yt_title}\n\nОПИСАНИЕ:\n{yt_desc}")[:1024]
                     await client.send_file(
                         SHORTS_CHAT, out, caption=caption,
                         attributes=[DocumentAttributeVideo(duration=int(total), w=W, h=H,
