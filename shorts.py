@@ -14,7 +14,10 @@ SHORTS_CHAT = os.environ.get("SHORTS_CHAT", "").strip() or "me"   # "me" = «И�
 MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 SCAN = 300          # сколько последних сообщений своего канала просматривать
 PER_RUN = 1         # сколько роликов делать за запуск
-MAX_PHOTOS = 5      # сколько фото брать из поста
+PHOTOS_PER_ITEM = 2 # сколько фото брать из каждого поста подборки
+MIN_ITEMS = 2       # минимум постов одного типа для подборки
+MAX_ITEMS = 3       # максимум постов в одной подборке
+CLASSIFY_BATCH = 30 # сколько постов определять по типу за один запрос к Gemini
 MAX_FAILS = 3
 STATE = "shorts_state.json"
 WORK = "work"
@@ -28,8 +31,8 @@ MUSIC_VOL_VOICE = 0.12                            # громкость музы�
 MUSIC_VOL_PLAIN = 0.60                            # громкость музыки, если голоса нет
 
 # --- монтаж ---
-TRANSITION = 0.35        # длительность перехода между сценами, сек
-PAUSE = 0.45             # пауза после фразы, сек
+TRANSITION = 0.30        # длительность перехода между сценами, сек
+PAUSE = 0.12             # пауза после фразы, сек
 FALLBACK_DUR = {"hook": 2.8, "bullet": 3.6, "cta": 3.0}   # длительность сцен, если голоса нет
 XFADES = ["fade", "slideleft", "slideright", "smoothleft", "smoothright", "wipeleft", "circleopen", "dissolve"]
 MOTIONS = ["in", "left", "out", "up"]             # движение камеры по сценам по кругу
@@ -47,38 +50,100 @@ SAFE_TOP = 190       # сверху YouTube закрывает интерфей�
 SAFE_BOTTOM = 360    # снизу закрывают название, описание и музыка
 COLUMN_W = 880       # ширина центральной колонки
 
-PROMPT = (
-    "Ты автор вирусных Shorts про Minecraft Bedrock. Цель: чтобы зритель, прочитав и послушав ролик, "
-    "захотел СРАЗУ скачать мод и поиграть. По тексту поста напиши сценарий ролика. "
-    "Используй только факты из текста, ничего не выдумывай, но подавай их ярко и конкретно.\n\n"
-    "ПРАВИЛА:\n"
-    "1. hook: первая фраза ролика, до 8 слов. Интрига, вопрос или неожиданный факт именно про этот мод. "
-    "Не «Новый мод» и не «Смотрите». Примеры стиля: «Этот мод превращает выживание в RPG», "
-    "«А ты знал, что в Майнкрафте можно так строить?».\n"
-    "2. bullets: ровно 3 пункта по 40-75 символов. Каждый отвечает: ЧТО ИМЕННО появляется или меняется "
-    "в игре и что игрок с этого получает. Называй конкретно: предметы, мобов, способности, механики, "
-    "числа из текста. ЗАПРЕЩЕНЫ пустые фразы: «улучшает геймплей», «новые возможности», "
-    "«интересные механики», «много нового». Версии игры и ссылки в пункты не пиши. "
-    "Начинай пункт с сильного слова или глагола.\n"
-    "3. voice: ровно 3 фразы для диктора, по одной на каждый пункт, по 8-16 слов, живая разговорная речь, "
-    "как будто рассказываешь другу; можно на «ты». Без эмодзи и номеров версий.\n"
-    "4. В hook и voice все иностранные слова пиши русскими буквами, как слышатся "
-    "(Minecraft = Майнкрафт, Add-On = аддон), чтобы диктор прочитал правильно.\n\n"
-    "Верни ТОЛЬКО JSON без пояснений:\n"
-    '{"hook": "...",\n'
-    ' "title": "заголовок до 45 символов, без эмодзи и хэштегов",\n'
-    ' "bullets": ["...", "...", "..."],\n'
-    ' "voice": ["...", "...", "..."],\n'
-    ' "yt_title": "название видео для YouTube до 90 символов, с упоминанием Minecraft",\n'
-    ' "yt_description": "2-3 предложения о моде или идее и призыв скачать бесплатно в Telegram, '
-    'ссылка в шапке канала; в конце хэштеги #Shorts #Minecraft и ещё 2-3 по теме"}\n\n'
-    "Текст поста:\n"
+TYPES = {
+    "addon": "аддоны и моды",
+    "cheats": "читы и клиенты",
+    "build": "постройки",
+    "world": "карты и миры",
+    "texture": "текстуры и шейдеры",
+    "other": "разное",
+}
+
+KEYWORDS = [  # запасной вариант, если Gemini недоступен: определение типа по словам
+    ("cheats", ["чит", "клиент", "хак", "cheat", "client", "hack"]),
+    ("texture", ["текстур", "шейдер", "ресурспак", "texture", "shader"]),
+    ("build", ["построй", "постройк", "схем", "build", "замок", "особняк"]),
+    ("world", ["карта", "карту", "мир ", "сид", "seed", "world", "map"]),
+    ("addon", ["аддон", "addon", "мод", "mod", "mcaddon", "dlc"]),
+]
+
+CLASSIFY_PROMPT = (
+    "Определи тип каждого поста из Telegram-канала про Minecraft Bedrock.\n"
+    "Типы:\n"
+    "addon: аддон, мод или DLC, который добавляет механики, предметы, мобов, оружие, способности;\n"
+    "cheats: чит-клиент, хак, утилита или программа для игры с читами;\n"
+    "build: идея постройки, дом, замок, ферма, схема, чертёж;\n"
+    "world: карта, готовый мир, сид, приключение;\n"
+    "texture: текстурпак, ресурспак, шейдеры;\n"
+    "other: всё остальное (новости, опросы, реклама).\n"
+    'Верни ТОЛЬКО JSON вида {"123": "addon", "124": "build"} для всех id из списка.\n\n'
+    "Посты (id: начало текста):\n"
 )
+
+
+def guess_type(text):
+    low = (text or "").lower()
+    for t, kws in KEYWORDS:
+        if any(k in low for k in kws):
+            return t
+    return "other"
+
+
+def script_prompt(label, k, per_item, posts_text):
+    if k > 1:
+        task = (f"Сделай сценарий одного ролика-подборки: {k} поста из рубрики «{label}». "
+                "Ролик показывает все по очереди.")
+    else:
+        task = f"Сделай сценарий ролика про один пост из рубрики «{label}»."
+    return (
+        "Ты автор вирусных Shorts про Minecraft Bedrock. Цель: чтобы зритель захотел СРАЗУ скачать и "
+        f"попробовать. {task} Используй только факты из текстов постов, ничего не выдумывай, "
+        "но подавай ярко и конкретно.\n\n"
+        "ПРАВИЛА:\n"
+        "1. hook: самая первая фраза ролика, до 9 слов, про ВСЮ подборку: интрига, вопрос или "
+        "неожиданный факт"
+        + (f", назови тип и число ({k}). Пример: «Три аддона, после которых выживание не будет прежним»"
+           if k > 1 else ". Пример: «Этот мод превращает выживание в RPG»")
+        + ". Не «Новый мод» и не «Смотрите».\n"
+        "2. Для каждого поста (в том же порядке, что в списке) напиши:\n"
+        "   name: название мода, постройки или мира, до 38 символов, без эмодзи и ссылок;\n"
+        f"   bullets: ровно {per_item} пункта по 35-65 символов. Каждый: ЧТО ИМЕННО появляется или "
+        "меняется в игре и что игрок с этого получает. Конкретно: предметы, мобы, способности, "
+        "числа из текста. ЗАПРЕЩЕНЫ пустые фразы: «улучшает геймплей», «новые возможности», "
+        "«интересные механики». Версии игры и ссылки не пиши;\n"
+        f"   voice: ровно {per_item} фразы для диктора, по одной на пункт, по 8-16 слов, живая "
+        "разговорная речь. Первая фраза поста сразу называет его и главную суть "
+        "(например: «Первый — аддон про перчатки, которые ломают блоки втрое быстрее»). "
+        "Не повторяй пункт дословно, добавляй, зачем это игроку.\n"
+        "3. ВАЖНО: после hook зритель сразу слышит первый пост. Не повторяй и не пересказывай hook, "
+        "не начинай фразы словами «слушай», «смотри», «представь», без вступлений и приветствий.\n"
+        "4. В hook и voice все иностранные слова пиши русскими буквами, как слышатся "
+        "(Minecraft = Майнкрафт, Add-On = аддон).\n\n"
+        "Верни ТОЛЬКО JSON без пояснений:\n"
+        '{"hook": "...",\n'
+        ' "items": [{"name": "...", "bullets": ["..."], "voice": ["..."]}],\n'
+        ' "yt_title": "название для YouTube до 90 символов, с Minecraft",\n'
+        ' "yt_description": "2-3 предложения: что в подборке, призыв скачать бесплатно в Telegram, '
+        'ссылка в шапке канала; в конце хэштеги #Shorts #Minecraft и ещё 2-3 по теме"}\n\n'
+        "Посты:\n" + posts_text
+    )
+
+
+def valid_script(d, k):
+    try:
+        if not (isinstance(d, dict) and d.get("hook") and isinstance(d.get("items"), list)):
+            return False
+        if len(d["items"]) != k:
+            return False
+        return all(it.get("name") and isinstance(it.get("bullets"), list) and it["bullets"]
+                   for it in d["items"])
+    except Exception:
+        return False
 
 
 # ---------- Gemini ----------
 
-def gemini_json(text):
+def gemini_raw(prompt, check):
     order = MODELS[:]
     random.shuffle(order)
     for model in order:
@@ -89,10 +154,10 @@ def gemini_json(text):
                     url,
                     headers={"x-goog-api-key": GEMINI_KEY},
                     json={
-                        "contents": [{"parts": [{"text": PROMPT + text}]}],
+                        "contents": [{"parts": [{"text": prompt}]}],
                         "generationConfig": {"temperature": 0.85, "responseMimeType": "application/json"},
                     },
-                    timeout=60,
+                    timeout=90,
                 )
             except Exception as e:
                 print(f"  Gemini {model}: сетевая ошибка ({e}), попытка {attempt}/2")
@@ -110,7 +175,7 @@ def gemini_json(text):
                 raw = "".join(p.get("text", "") for p in parts if not p.get("thought"))
                 raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.M).strip()
                 data = json.loads(raw)
-                if isinstance(data, dict) and data.get("title") and data.get("bullets"):
+                if check(data):
                     print(f"  Gemini {model}: OK")
                     return data
             except Exception:
@@ -119,6 +184,51 @@ def gemini_json(text):
             break
         print("  переключаюсь на следующую модель")
     return None
+
+
+def classify(posts, types):
+    """Определяет тип постов (пачками, одним запросом на 30 постов). Результат кладёт в types."""
+    run_types = {}
+    todo = [p for p in posts if str(p["id"]) not in types]
+    for i in range(0, len(todo), CLASSIFY_BATCH):
+        batch = todo[i:i + CLASSIFY_BATCH]
+        lines = "\n".join(f'{p["id"]}: {re.sub(chr(10), " ", p["text"])[:240]}' for p in batch)
+        res = gemini_raw(CLASSIFY_PROMPT + lines, lambda d: isinstance(d, dict))
+        for p in batch:
+            t = (res or {}).get(str(p["id"]))
+            if t in TYPES:
+                types[str(p["id"])] = t          # надёжный ответ Gemini запоминаем
+            else:
+                run_types[str(p["id"])] = guess_type(p["text"])   # запасной вариант только на этот запуск
+    for p in posts:
+        k = str(p["id"])
+        run_types.setdefault(k, types.get(k, "other"))
+    return run_types
+
+
+def pick_group(cands, run_types, last_type):
+    """Выбирает 2-3 поста одного типа для подборки. Если пар нет, берёт один свежий пост."""
+    newest_first = list(reversed(cands))
+    by = {}
+    for p in newest_first:
+        by.setdefault(run_types.get(str(p["id"]), "other"), []).append(p)
+    ready = [t for t, ps in by.items() if t != "other" and len(ps) >= MIN_ITEMS]
+    if ready:
+        pool = [t for t in ready if t != last_type] or ready
+        t = random.choices(pool, weights=[len(by[x]) for x in pool])[0]
+        pick = random.sample(by[t][:6], min(MAX_ITEMS, len(by[t][:6])))
+        pick.sort(key=lambda p: p["id"])
+        return pick, t
+    p = newest_first[0]
+    return [p], run_types.get(str(p["id"]), "other")
+
+
+def gemini_script(posts, type_key):
+    k = len(posts)
+    per_item = 3 if k == 1 else 2
+    text = "\n\n".join(f"[ПОСТ {n + 1}]\n{p['text'][:1500]}" for n, p in enumerate(posts))
+    return gemini_raw(script_prompt(TYPES.get(type_key, "разное"), k, per_item, text),
+                      lambda d: valid_script(d, k))
 
 
 # ---------- шрифты и текст ----------
@@ -180,16 +290,6 @@ def fit_lines(draw, text, kind, size, max_w, max_lines, min_size):
 
 
 # ---------- кадры ----------
-
-def crop_mode(img, mode):
-    """0 = целиком, 1/2/3 = приближение к углу или центру (тот же формат кадра)."""
-    if mode == 0:
-        return img
-    w, h = img.size
-    cw, ch = int(w * 0.66), int(h * 0.66)
-    x, y = {1: (0, 0), 2: (w - cw, h - ch), 3: ((w - cw) // 2, (h - ch) // 2)}[mode]
-    return img.crop((x, y, x + cw, y + ch))
-
 
 def make_bg(img):
     bg = ImageOps.fit(img, (W, H), method=Image.LANCZOS).filter(ImageFilter.GaussianBlur(45))
@@ -307,20 +407,26 @@ def draw_scene(L, img, stage, out_png):
     canvas.convert("RGB").save(out_png)
 
 
-def draw_hook(img, hook, out_png):
-    """Заставка: крупная зацепка на жёлтой плашке + фото."""
-    canvas = make_bg(img)
-    CW, PAD, GAP = COLUMN_W, 44, 36
+def draw_hook(imgs, hook, out_png):
+    """Заставка: крупная зацепка на жёлтой плашке + фото всех постов подборки рядом."""
+    canvas = make_bg(imgs[0])
+    CW, PAD, GAP, TG = COLUMN_W, 44, 36, 16
     X0 = (W - CW) // 2
     m = ImageDraw.Draw(canvas)
     f, lines, size = fit_lines(m, hook.upper(), "title", 104, CW - 2 * PAD, 4, 60)
     lh = int(size * 1.2)
     plate_h = len(lines) * lh + 2 * PAD
     avail = (H - SAFE_BOTTOM) - SAFE_TOP
+    k = len(imgs)
     box_w = CW - 24
-    aspect = img.size[0] / img.size[1]
-    box_h = int(max(300, min(800, box_w / aspect, avail - plate_h - GAP - 16)))
-    y = SAFE_TOP + max(0, (avail - (plate_h + GAP + box_h + 16)) // 2)
+    tile_w = (box_w - TG * (k - 1)) // k
+    room = avail - plate_h - GAP - 16
+    if k == 1:
+        aspect = imgs[0].size[0] / imgs[0].size[1]
+        tile_h = int(max(300, min(800, tile_w / aspect, room)))
+    else:
+        tile_h = int(max(300, min(tile_w * 1.5, room, 820)))
+    y = SAFE_TOP + max(0, (avail - (plate_h + GAP + tile_h + 16)) // 2)
 
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     od = ImageDraw.Draw(overlay)
@@ -328,11 +434,12 @@ def draw_hook(img, hook, out_png):
                          outline=(0, 0, 0, 255), width=6)
     plate_y = y
     y += plate_h + GAP
-    od.rounded_rectangle(((W - box_w) // 2 - 8, y, (W - box_w) // 2 + box_w + 8, y + box_h + 16),
-                         radius=40, fill=(255, 255, 255, 235))
+    px = (W - box_w) // 2
+    od.rounded_rectangle((px - 8, y, px + box_w + 8, y + tile_h + 16), radius=40, fill=(255, 255, 255, 235))
     canvas = Image.alpha_composite(canvas, overlay)
-    pb, mask = photo_box(img, box_w, box_h)
-    canvas.paste(pb, ((W - box_w) // 2, y + 8), mask)
+    for j, im in enumerate(imgs):
+        pb, mask = photo_box(im, tile_w, tile_h)
+        canvas.paste(pb, (px + j * (tile_w + TG), y + 8), mask)
     d = ImageDraw.Draw(canvas)
     for i, ln in enumerate(lines):
         d.text((W // 2, plate_y + PAD + i * lh + lh // 2), ln, font=f, fill="black", anchor="mm")
@@ -446,27 +553,6 @@ def probe(path):
         return 0.0
 
 
-async def tts(text, path):
-    """Озвучивает текст нейроголосом Microsoft (edge-tts). Возвращает длительность или 0."""
-    try:
-        import edge_tts
-    except ImportError:
-        print("  TTS: не установлен edge-tts")
-        return 0.0
-    text = tts_prep(text)
-    for voice in dict.fromkeys([VOICE, "ru-RU-SvetlanaNeural"]):
-        try:
-            await edge_tts.Communicate(text, voice, rate=VOICE_RATE).save(path)
-            d = probe(path)
-            if d > 0.3:
-                return d
-        except Exception as e:
-            print(f"  TTS {voice}: {e}")
-    return 0.0
-
-
-# ---------- видео ----------
-
 def run(cmd):
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
@@ -474,33 +560,69 @@ def run(cmd):
         raise RuntimeError("ffmpeg завершился с ошибкой")
 
 
-def motion_vf(kind, n, strength):
-    cx, cy = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
-    x, y = cx, cy
+def trim_silence(src, dst):
+    """Убирает тишину в начале и в конце фразы, иначе между фразами получается длинная пауза."""
+    one = "silenceremove=start_periods=1:start_threshold=-45dB:detection=peak"
+    run(["ffmpeg", "-y", "-i", src, "-af", f"{one},areverse,{one},areverse",
+         "-ar", "24000", "-ac", "1", dst])
+
+
+async def tts(text, path):
+    """Озвучивает текст нейроголосом Microsoft (edge-tts). Возвращает (длительность, файл) или (0, None)."""
+    try:
+        import edge_tts
+    except ImportError:
+        print("  TTS: не установлен edge-tts")
+        return 0.0, None
+    text = tts_prep(text)
+    raw = path + ".raw.mp3"
+    for voice in dict.fromkeys([VOICE, "ru-RU-SvetlanaNeural"]):
+        try:
+            await edge_tts.Communicate(text, voice, rate=VOICE_RATE).save(raw)
+            if probe(raw) < 0.3:
+                continue
+            try:
+                trim_silence(raw, path)
+                d = probe(path)
+                if d > 0.3:
+                    return d, path
+            except Exception as e:
+                print(f"  TTS: не удалось обрезать тишину ({e}), беру как есть")
+            return probe(raw), raw
+        except Exception as e:
+            print(f"  TTS {voice}: {e}")
+    return 0.0, None
+
+
+# ---------- видео ----------
+
+def motion_vf(kind, n, S, p0, p1):
+    """Плавное движение камеры. p0..p1 — какую часть общего движения проходит эта сцена."""
+    p = f"({p0:.4f}+({p1 - p0:.4f})*on/{n})"
+    x, y = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
     if kind == "in":
-        z = f"1+{strength}*on/{n}"
+        z = f"1+{S}*{p}"
     elif kind == "out":
-        z = f"{1 + strength}-{strength}*on/{n}"
+        z = f"1+{S}-{S}*{p}"
     elif kind == "left":
-        z = f"{1 + strength}"
-        x = f"(iw-iw/zoom)*on/{n}"
+        z = f"{1 + S}"
+        x = f"(iw-iw/zoom)*{p}"
     else:  # up
-        z = f"{1 + strength}"
-        y = f"(ih-ih/zoom)*(1-on/{n})"
+        z = f"{1 + S}"
+        y = f"(ih-ih/zoom)*(1-{p})"
     return (f"scale=2160:3840,zoompan=z='{z}':x='{x}':y='{y}':d={n}:s={W}x{H}:fps={FPS},"
             f"format=yuv420p")
 
 
-def render_video(scenes, subs, out):
-    """scenes: список со словарями (png, d, motion, strength, flash). Возвращает общую длину."""
+def render_video(scenes, subs):
     n = len(scenes)
     T = TRANSITION
     clips = []
     for i, s in enumerate(scenes):
         clip = f"{WORK}/clip{i}.mp4"
         frames = int(s["d"] * FPS)
-        vf = motion_vf(s["motion"], frames, s["strength"])
-        if s.get("flash"):
+        vf = motion_vf(s["motion"], frames, s["S"], s["p0"], s["p1"])
+        if s["kind"] == "hook":
             vf += ",fade=t=in:st=0:d=0.35:color=white"
         run(["ffmpeg", "-y", "-i", s["png"], "-vf", vf, "-t", f"{s['d']:.3f}",
              "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", clip])
@@ -514,11 +636,13 @@ def render_video(scenes, subs, out):
     for sb in subs:
         cmd += ["-loop", "1", "-t", f"{total + 1:.2f}", "-i", sb["png"]]
 
-    fc, cur = [], "[0:v]"
-    prev = None
+    fc, cur, prev = [], "[0:v]", None
     for k in range(1, n):
-        tr = random.choice([t for t in XFADES if t != prev])
-        prev = tr
+        if scenes[k]["soft"]:      # тот же пост: мягкая смена, без слайдов
+            tr = random.choice(["fade", "dissolve"])
+        else:                      # новый пост: заметный переход
+            tr = random.choice([t for t in XFADES if t != prev])
+            prev = tr
         off = sum(s["d"] for s in scenes[:k]) - k * T
         fc.append(f"{cur}[{k}:v]xfade=transition={tr}:duration={T}:offset={off:.3f}[x{k}]")
         cur = f"[x{k}]"
@@ -587,42 +711,41 @@ def mix_audio(scenes, total, out):
     run(cmd)
 
 
-async def build_short(paths, data, out):
-    """Собирает ролик из фото и сценария Gemini. Возвращает длительность."""
-    title = clean(data["title"])[:60] or "Minecraft"
-    hook = clean(data.get("hook") or "")[:70] or title
-    bullets = [clean(b)[:80] for b in data["bullets"] if clean(b)][:3]
-    voice_lines = [clean(v)[:150] for v in (data.get("voice") or []) if clean(v)]
-    while len(voice_lines) < len(bullets):
-        voice_lines.append(bullets[len(voice_lines)])
-    voice_lines = voice_lines[:len(bullets)]
+async def build_short(items, hook, out):
+    """items: [{name, imgs, bullets, voices}]. Собирает ролик-подборку. Возвращает длительность."""
+    k = len(items)
+    plan = [dict(kind="hook", text=hook, soft=False, item=-1)]
+    for ii, it in enumerate(items):
+        title = f"{ii + 1}. {it['name']}" if k > 1 else it["name"]
+        a = it["imgs"][0].size
+        it["L"] = compute_layout(title, it["bullets"], a[0] / a[1])
+        for bi in range(len(it["bullets"])):
+            plan.append(dict(kind="bullet", item=ii, stage=bi + 1, L=it["L"],
+                             img=it["imgs"][bi % len(it["imgs"])], text=it["voices"][bi], soft=bi > 0))
+    last = items[-1]
+    cta_text = ("Всё это бесплатно в Телеграме. Ссылка в шапке канала." if k > 1
+                else "Скачивай бесплатно в Телеграме. Ссылка в шапке канала.")
+    plan.append(dict(kind="cta", item=k - 1, stage=len(last["bullets"]) + 1, L=last["L"],
+                     img=plan[-1]["img"], text=cta_text, soft=True))
 
-    imgs = [Image.open(p).convert("RGB") for p in paths]
-    n_img = len(imgs)
-    L = compute_layout(title, bullets, imgs[0].size[0] / imgs[0].size[1])
-
-    nb = len(bullets)
-    plan = [dict(kind="hook", text=hook)]
-    plan += [dict(kind="bullet", text=voice_lines[i], k=i + 1) for i in range(nb)]
-    plan += [dict(kind="cta", text="Скачивай бесплатно в Телеграме. Ссылка в шапке канала.")]
+    # движение камеры: на один пост одно непрерывное движение, которое делится между его сценами
+    for ii in range(k):
+        idxs = [i for i, s in enumerate(plan) if s["item"] == ii]
+        for j, i in enumerate(idxs):
+            plan[i].update(motion=MOTIONS[ii % len(MOTIONS)], S=0.07,
+                           p0=j / len(idxs), p1=(j + 1) / len(idxs))
+    plan[0].update(motion="in", S=0.12, p0=0.0, p1=1.0)
 
     voice_ok = VOICE_ON
     for si, s in enumerate(plan):
-        img = crop_mode(imgs[si % n_img], (si // n_img) % 4)
         s["png"] = f"{WORK}/scene{si}.png"
         if s["kind"] == "hook":
-            draw_hook(imgs[0], hook, s["png"])
-        elif s["kind"] == "bullet":
-            draw_scene(L, img, s["k"], s["png"])
+            draw_hook([it["imgs"][0] for it in items], hook, s["png"])
         else:
-            draw_scene(L, img, nb + 1, s["png"])
-        s["motion"] = "in" if s["kind"] == "hook" else MOTIONS[si % len(MOTIONS)]
-        s["strength"] = 0.14 if s["kind"] == "hook" else 0.08
-        s["flash"] = s["kind"] == "hook"
-        s["voice_d"] = 0.0
+            draw_scene(s["L"], s["img"], s["stage"], s["png"])
+        s["voice_d"], s["voice"] = 0.0, None
         if voice_ok:
-            s["voice"] = f"{WORK}/voice{si}.mp3"
-            s["voice_d"] = await tts(s["text"], s["voice"])
+            s["voice_d"], s["voice"] = await tts(s["text"], f"{WORK}/voice{si}.wav")
             if not s["voice_d"]:
                 print("  озвучка недоступна, делаю ролик без голоса")
                 voice_ok = False
@@ -631,9 +754,8 @@ async def build_short(paths, data, out):
         base = s["voice_d"] if s["voice_d"] else FALLBACK_DUR[s["kind"]]
         s["d"] = base + PAUSE + TRANSITION
 
-    # моменты начала сцен на итоговой шкале времени
     t = 0.0
-    for s in plan:
+    for s in plan:           # момент начала каждой сцены на итоговой шкале времени
         s["start"] = t
         t += s["d"] - TRANSITION
 
@@ -649,10 +771,10 @@ async def build_short(paths, data, out):
                 dur = s["voice_d"] * w / sum(weights)
                 png = f"{WORK}/sub{len(subs)}.png"
                 h = draw_sub(c, png)
-                subs.append(dict(png=png, a=at, b=at + dur, y=L["photo_bottom"] - h - 16))
+                subs.append(dict(png=png, a=at, b=at + dur, y=s["L"]["photo_bottom"] - h - 16))
                 at += dur
 
-    total = render_video(plan, subs, out)
+    total = render_video(plan, subs)
     mix_audio(plan, total, out)
     return total
 
@@ -664,41 +786,66 @@ async def main():
     state = json.load(open(STATE)) if os.path.exists(STATE) else {}
     used = set(state.get("used", []))
     fails = state.get("fails", {})
+    types = state.get("types", {})
+    last_type = state.get("last_type", "")
     done = 0
     try:
         async with TelegramClient(StringSession(SESSION), API_ID, API_HASH) as client:
             target = await client.get_entity(TARGET)
-            cands = await find_candidates(client, target, used)
-            print("Кандидатов:", len(cands))
-            for p in reversed(cands):  # самые свежие первыми
-                if done >= PER_RUN:
+            for _ in range(PER_RUN):
+                cands = [p for p in await find_candidates(client, target, used)]
+                print("Кандидатов:", len(cands))
+                if not cands:
                     break
-                tag = f"[пост #{p['id']}]"
+                run_types = classify(cands, types)
+                counts = {}
+                for v in run_types.values():
+                    counts[v] = counts.get(v, 0) + 1
+                print("Типы постов:", {TYPES.get(a, a): b for a, b in counts.items()})
+                group, gtype = pick_group(cands, run_types, last_type)
+                tag = f"[{TYPES.get(gtype, gtype)}: {', '.join('#' + str(p['id']) for p in group)}]"
+                print(tag, "собираю ролик")
                 try:
                     shutil.rmtree(WORK, ignore_errors=True)
                     os.makedirs(WORK, exist_ok=True)
-                    print(tag, "скачиваю фото:", len(p["photos"][:MAX_PHOTOS]))
-                    paths = []
-                    for i, m in enumerate(p["photos"][:MAX_PHOTOS]):
-                        path = await client.download_media(m, file=f"{WORK}/p{p['id']}_{i}.jpg")
-                        if path:
-                            paths.append(path)
-                    if not paths:
+                    got, photo_sets = [], []
+                    for p in group:
+                        paths = []
+                        for i, m in enumerate(p["photos"][:PHOTOS_PER_ITEM]):
+                            path = await client.download_media(m, file=f"{WORK}/p{p['id']}_{i}.jpg")
+                            if path:
+                                paths.append(path)
+                        if paths:
+                            got.append(p)
+                            photo_sets.append(paths)
+                    if not got:
                         raise RuntimeError("не удалось скачать фото")
 
                     print(tag, "запрос к Gemini")
-                    data = gemini_json(p["text"][:3000])
+                    data = gemini_script(got, gtype)
                     if not data:
-                        raise RuntimeError("Gemini не вернул текст")
-                    title = clean(data["title"])[:60] or "Minecraft"
-                    yt_title = (data.get("yt_title") or title).strip()[:95]
+                        raise RuntimeError("Gemini не вернул сценарий")
+
+                    per_item = 3 if len(got) == 1 else 2
+                    items = []
+                    for it, paths in zip(data["items"], photo_sets):
+                        bullets = [clean(b)[:80] for b in it["bullets"] if clean(b)][:per_item]
+                        voices = [clean(v)[:150] for v in (it.get("voice") or []) if clean(v)]
+                        while len(voices) < len(bullets):
+                            voices.append(bullets[len(voices)])
+                        items.append(dict(name=clean(it["name"])[:38] or "Minecraft",
+                                          imgs=[Image.open(x).convert("RGB") for x in paths],
+                                          bullets=bullets, voices=voices[:len(bullets)]))
+                    hook = clean(data["hook"])[:80]
+
+                    out = f"{WORK}/short.mp4"
+                    total = await build_short(items, hook, out)
+                    print(tag, f"ролик собран, {total:.1f} сек")
+
+                    yt_title = (data.get("yt_title") or hook).strip()[:95]
                     yt_desc = (data.get("yt_description") or "").strip()
                     if "#shorts" not in yt_desc.lower():
                         yt_desc += "\n#Shorts #Minecraft"
-
-                    out = f"{WORK}/short_{p['id']}.mp4"
-                    total = await build_short(paths, data, out)
-                    print(tag, f"ролик собран, {total:.1f} сек")
 
                     yt_link = ""
                     if YT_ID and YT_SECRET and YT_REFRESH:
@@ -714,20 +861,25 @@ async def main():
                         attributes=[DocumentAttributeVideo(duration=int(total), w=W, h=H,
                                                            supports_streaming=True)],
                     )
-                    used.add(p["id"])
-                    fails.pop(str(p["id"]), None)
+                    for p in got:
+                        used.add(p["id"])
+                        fails.pop(str(p["id"]), None)
+                    last_type = gtype
                     done += 1
                     print(tag, "ролик отправлен в", SHORTS_CHAT)
                 except Exception as e:
-                    k = str(p["id"])
-                    fails[k] = fails.get(k, 0) + 1
-                    print(tag, f"ошибка: {e} (попытка {fails[k]}/{MAX_FAILS})")
-                    if fails[k] >= MAX_FAILS:
-                        used.add(p["id"])
-                        print(tag, "пропущен навсегда")
+                    for p in group:
+                        kk = str(p["id"])
+                        fails[kk] = fails.get(kk, 0) + 1
+                        print(tag, f"ошибка: {e} (пост #{p['id']}, попытка {fails[kk]}/{MAX_FAILS})")
+                        if fails[kk] >= MAX_FAILS:
+                            used.add(p["id"])
+                            print(tag, f"пост #{p['id']} пропущен навсегда")
     finally:
         state["used"] = sorted(used)[-2000:]
         state["fails"] = fails
+        state["types"] = dict(list(types.items())[-3000:])
+        state["last_type"] = last_type
         json.dump(state, open(STATE, "w"))
     print("Готово, роликов:", done)
 
