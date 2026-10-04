@@ -278,6 +278,14 @@ def build_posts(msgs):
     return posts
 
 
+VERSION = "v5: запрет пересылки больше не блокирует"
+
+
+def can_copy(ent):
+    """Проверка снята: каналы с запретом пересылки копируем, файлы скачиваем и загружаем заново."""
+    return True
+
+
 # ---------- файлы по ссылке «Скачать» (когда файлы лежат в другом канале) ----------
 
 DL_WORDS = re.compile(r"скач|download|загруз|файл|apk", re.I)
@@ -390,9 +398,9 @@ async def resolve_files(client, p, cache):
             if ref not in cache:
                 cache[ref] = await client.get_entity(ref)
             ent = cache[ref]
-            if getattr(ent, "noforwards", False):
+            if not can_copy(ent):
                 blocked = True
-                print(f"  канал {ref}: запрет копирования, файлы не беру")
+                print(f"  канал {ref}: запрет копирования, и это не твой канал, файлы не беру")
                 continue
             got = await files_from_link(client, ent, mid) if mid else await files_by_name(client, ent, p)
             found += got
@@ -482,6 +490,7 @@ async def main():
                 seen.append(k)
                 seen_set.add(k)
 
+    print("Версия repost.py:", VERSION)
     print("Источники:", len(SOURCES), "| state:",
           {k: v for k, v in state.items() if not k.startswith("_")})
     try:
@@ -505,12 +514,12 @@ async def main():
                 except Exception as e:
                     print(f"[{src}] не удалось открыть канал: {e}")
                     continue
-                if getattr(entity, "noforwards", False):
-                    print(f"[{src}] у канала включён запрет копирования, владелец не разрешил, пропускаю")
+                if not can_copy(entity):
+                    print(f"[{src}] запрет копирования, и аккаунт бота не создатель и не админ этого канала, пропускаю")
                     continue
                 protected_src[src] = bool(getattr(entity, "noforwards", False))
                 if protected_src[src]:
-                    print(f"[{src}] пересылка запрещена: файлы буду скачивать и загружать заново")
+                    print(f"[{src}] запрет пересылки: скачиваю файлы и загружаю заново")
                 last = state.get(src, 0)
                 if last:
                     it = client.iter_messages(entity, min_id=last, reverse=True)
