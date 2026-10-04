@@ -1,4 +1,4 @@
-import os, re, json, glob, random, shutil, subprocess, asyncio, time, requests
+import os, io, base64, re, json, glob, random, shutil, subprocess, asyncio, time, requests
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance, ImageOps
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -14,7 +14,7 @@ SHORTS_CHAT = os.environ.get("SHORTS_CHAT", "").strip() or "me"   # "me" = «И�
 MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 SCAN = 300          # сколько последних сообщений своего канала просматривать
 PER_RUN = 1         # сколько роликов делать за запуск
-PHOTOS_PER_ITEM = 2 # сколько фото брать из каждого поста подборки
+PHOTOS_PER_ITEM = 5 # сколько фото брать из каждого поста (из них Gemini подбирает подходящие по смыслу)
 MIN_ITEMS = 2       # минимум постов одного типа для подборки
 MAX_ITEMS = 3       # максимум постов в одной подборке
 CLASSIFY_BATCH = 30 # сколько постов определять по типу за один запрос к Gemini
@@ -28,6 +28,9 @@ VOICE_ON = True                                   # False = ролик без г
 VOICE = os.environ.get("TTS_VOICE", "").strip() or "ru-RU-DmitryNeural"   # мужской; женский: ru-RU-SvetlanaNeural
 VOICE_RATE = "+10%"                               # скорость речи: "+0%" обычная, "+15%" бодрее
 MUSIC_VOL_VOICE = 0.12                            # громкость музыки под голосом (0.0-1.0)
+SFX_ON = True                                     # звуки: свист, щелчок, удар. False = без звуков
+SFX_VOL = 0.45                                    # громкость звуков (0.0-1.0)
+SWAP_AT = 0.5                                     # на какой доле фразы появляется второе фото
 MUSIC_VOL_PLAIN = 0.60                            # громкость музыки, если голоса нет
 
 # --- монтаж ---
@@ -165,7 +168,12 @@ def valid_script(d, k):
 
 # ---------- Gemini ----------
 
-def gemini_raw(prompt, check):
+def gemini_raw(prompt, check, images=None):
+    parts_in = []
+    for i, b64 in enumerate(images or [], 1):
+        parts_in.append({"text": f"Фото {i}:"})
+        parts_in.append({"inline_data": {"mime_type": "image/jpeg", "data": b64}})
+    parts_in.append({"text": prompt})
     order = MODELS[:]
     random.shuffle(order)
     for model in order:
@@ -176,7 +184,7 @@ def gemini_raw(prompt, check):
                     url,
                     headers={"x-goog-api-key": GEMINI_KEY},
                     json={
-                        "contents": [{"parts": [{"text": prompt}]}],
+                        "contents": [{"parts": parts_in}],
                         "generationConfig": {"temperature": 0.85, "responseMimeType": "application/json"},
                     },
                     timeout=90,
@@ -408,32 +416,64 @@ def compute_layout(title, bullets, aspect):
     return L
 
 
+def plate_img(L, i, mode):
+    """Плашка пункта i. mode: hidden (заготовка), current (подсвечен), past (уже показан), full (финал)."""
+    CW, bh = L["CW"], L["b_heights"][i]
+    im = Image.new("RGBA", (CW, bh), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    if mode == "hidden":
+        d.rounded_rectangle((0, 0, CW - 1, bh - 1), radius=30, fill=(15, 15, 25, 70),
+                            outline=(255, 255, 255, 40), width=2)
+        return im
+    cur = mode == "current"
+    d.rounded_rectangle((0, 0, CW - 1, bh - 1), radius=30, fill=(15, 15, 25, 228),
+                        outline=ACCENT + (255,) if cur else (255, 255, 255, 110), width=5 if cur else 3)
+    col = "white" if mode in ("current", "full") else (205, 205, 215)
+    for j, ln in enumerate(L["b_lines"][i]):
+        d.text((CW // 2, L["pad_b"] + j * L["lh_b"] + L["lh_b"] // 2), ln,
+               font=L["fb"], fill=col, anchor="mm")
+    return im
+
+
+def cta_img(L, active):
+    """Жёлтая плашка с призывом. active=False: тусклая заготовка без текста."""
+    CW, ch = L["CW"], L["cta_h"]
+    im = Image.new("RGBA", (CW, ch), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    d.rounded_rectangle((0, 0, CW - 1, ch - 1), radius=40, fill=ACCENT + (255 if active else 55,))
+    if not active:
+        return im
+    cta = f"Скачать в Telegram: {HANDLE}" if HANDLE else "Скачать бесплатно в Telegram"
+    fs = 50
+    while True:
+        fc = get_font("cta", fs)
+        if d.textlength(cta, font=fc) <= CW - 2 * L["PAD"]:
+            break
+        if fs <= 28:
+            if HANDLE and cta != HANDLE:
+                cta, fs = HANDLE, 50
+                continue
+            break
+        fs -= 4
+    d.text((CW // 2, 52), cta, font=fc, fill="black", anchor="mm")
+    d.text((CW // 2, 100), "ссылка в шапке канала", font=get_font("text", 30), fill=(40, 40, 40), anchor="mm")
+    return im
+
+
 def draw_scene(L, img, stage, out_png):
-    """stage = сколько пунктов уже показано (1..N); stage = N+1 — финальная сцена с призывом."""
+    """Рисует основу сцены. Новая плашка не рисуется: возвращается отдельным слоем для анимации.
+    stage = сколько пунктов показано (1..N); stage = N+1 это финал с призывом."""
     nb = len(L["b_lines"])
     cta_on = stage > nb
     canvas = make_bg(img)
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     od = ImageDraw.Draw(overlay)
     X0, CW = L["X0"], L["CW"]
-
     od.rounded_rectangle((X0, L["title_y"], X0 + CW, L["title_y"] + L["title_h"]), radius=36,
                          fill=DARK, outline=ACCENT + (255,), width=5)
     od.rounded_rectangle((L["px"] - 8, L["photo_y"], L["px"] + L["box_w"] + 8, L["photo_y"] + L["box_h"] + 16),
                          radius=40, fill=(255, 255, 255, 235))
-    for i, (by, bh) in enumerate(zip(L["bullet_ys"], L["b_heights"])):
-        if i < stage:
-            cur = (i == stage - 1) and not cta_on
-            od.rounded_rectangle((X0, by, X0 + CW, by + bh), radius=30, fill=(15, 15, 25, 228),
-                                 outline=ACCENT + (255,) if cur else (255, 255, 255, 110),
-                                 width=5 if cur else 3)
-        else:
-            od.rounded_rectangle((X0, by, X0 + CW, by + bh), radius=30, fill=(15, 15, 25, 70),
-                                 outline=(255, 255, 255, 40), width=2)
-    od.rounded_rectangle((X0, L["cta_y"], X0 + CW, L["cta_y"] + L["cta_h"]), radius=40,
-                         fill=ACCENT + (255 if cta_on else 55,))
     canvas = Image.alpha_composite(canvas, overlay)
-
     pb, mask = photo_box(img, L["box_w"], L["box_h"])
     canvas.paste(pb, (L["px"], L["photo_y"] + 8), mask)
 
@@ -441,30 +481,23 @@ def draw_scene(L, img, stage, out_png):
     for i, ln in enumerate(L["t_lines"]):
         d.text((W // 2, L["title_y"] + L["PAD"] + i * L["lh_t"] + L["lh_t"] // 2), ln,
                font=L["ft"], fill="white", anchor="mm")
-    for i, (by, ls) in enumerate(zip(L["bullet_ys"], L["b_lines"])):
-        if i >= stage:
-            continue
-        col = "white" if (i == stage - 1 or cta_on) else (205, 205, 215)
-        for j, ln in enumerate(ls):
-            d.text((W // 2, by + L["pad_b"] + j * L["lh_b"] + L["lh_b"] // 2), ln,
-                   font=L["fb"], fill=col, anchor="mm")
-    if cta_on:
-        cta = f"Скачать в Telegram: {HANDLE}" if HANDLE else "Скачать бесплатно в Telegram"
-        fs = 50
-        while True:
-            fc = get_font("cta", fs)
-            if d.textlength(cta, font=fc) <= CW - 2 * L["PAD"]:
-                break
-            if fs <= 28:
-                if cta != HANDLE and HANDLE:
-                    cta, fs = HANDLE, 50
-                    continue
-                break
-            fs -= 4
-        d.text((W // 2, L["cta_y"] + 52), cta, font=fc, fill="black", anchor="mm")
-        d.text((W // 2, L["cta_y"] + 100), "ссылка в шапке канала", font=get_font("text", 30),
-               fill=(40, 40, 40), anchor="mm")
+    for i in range(nb):
+        mode = "full" if cta_on else ("past" if i < stage - 1 else "hidden")
+        canvas.alpha_composite(plate_img(L, i, mode), (X0, L["bullet_ys"][i]))
+    canvas.alpha_composite(cta_img(L, False), (X0, L["cta_y"]))
     canvas.convert("RGB").save(out_png)
+
+    if cta_on:
+        return dict(img=cta_img(L, True), x=X0, y=L["cta_y"], kind="pop", dur=0.55)
+    return dict(img=plate_img(L, stage - 1, "current"), x=X0, y=L["bullet_ys"][stage - 1],
+                kind="slide", dur=0.45)
+
+
+def photo_layer(L, img):
+    """Второе фото для плавной подмены в рамке."""
+    pb, mask = photo_box(img, L["box_w"], L["box_h"])
+    pb.putalpha(mask)
+    return dict(img=pb, x=L["px"], y=L["photo_y"] + 8, kind="fade", dur=0.4)
 
 
 def draw_hook(imgs, hook, out_png):
@@ -663,22 +696,136 @@ async def tts(text, path):
 
 # ---------- видео ----------
 
-def motion_vf(kind, n, S, p0, p1):
-    """Плавное движение камеры. p0..p1 — какую часть общего движения проходит эта сцена."""
-    p = f"({p0:.4f}+({p1 - p0:.4f})*on/{n})"
-    x, y = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+# ---------- подбор фото по смыслу (Gemini смотрит на картинки) ----------
+
+def img_b64(im, side=512):
+    t = im.copy()
+    t.thumbnail((side, side))
+    buf = io.BytesIO()
+    t.convert("RGB").save(buf, "JPEG", quality=72)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def valid_shots(d, k, n):
+    try:
+        sh = d["shots"]
+        return (isinstance(sh, list) and len(sh) == k and
+                all(isinstance(x, list) and x and all(isinstance(i, int) and 1 <= i <= n for i in x)
+                    for x in sh))
+    except Exception:
+        return False
+
+
+def pick_shots(name, voices, imgs):
+    """Для каждой фразы диктора выбирает 1-2 фото, подходящих по смыслу. Запасной вариант: по кругу."""
+    n, k = len(imgs), len(voices)
+    fallback = [[j % n, (j + 1) % n] if n > 1 else [0] for j in range(k)]
+    if n < 3:
+        return fallback
+    lines = "\n".join(f"{j + 1}. {v}" for j, v in enumerate(voices))
+    prompt = (
+        f"Выше {n} фото из поста про «{name}» для Minecraft (пронумерованы с 1). "
+        "Для каждой фразы диктора выбери 1-2 фото, которые лучше всего подходят по смыслу к тому, "
+        "о чём в ней говорится (показывают описанный предмет, моба, постройку, механику). "
+        "Если точного совпадения нет, выбери самые яркие. Первым в списке фразы ставь главное фото. "
+        "Одно и то же главное фото у разных фраз по возможности не повторяй.\n"
+        f"Фразы:\n{lines}\n\n"
+        f'Верни ТОЛЬКО JSON вида {{"shots": [[1, 3], [2], ...]}}: по одному списку на каждую фразу, '
+        f"всего {k} списков."
+    )
+    d = gemini_raw(prompt, lambda x: valid_shots(x, k, n), images=[img_b64(im) for im in imgs])
+    if not d:
+        print("  фото по смыслу не подобрались, раскладываю по кругу")
+        return fallback
+    out = []
+    for lst in d["shots"]:
+        uniq = []
+        for i in lst:
+            if i - 1 not in uniq:
+                uniq.append(i - 1)
+        out.append(uniq[:2])
+    return out
+
+
+# ---------- кадры с анимацией ----------
+
+def ease_out(u):
+    return 1 - (1 - u) ** 3
+
+
+def ease_back(u):
+    c1 = 1.70158
+    c3 = c1 + 1
+    return 1 + c3 * (u - 1) ** 3 + c1 * (u - 1) ** 2
+
+
+def cam(kind, S, p):
+    """Движение камеры: масштаб и положение окна (0..1) по прогрессу p."""
     if kind == "in":
-        z = f"1+{S}*{p}"
-    elif kind == "out":
-        z = f"1+{S}-{S}*{p}"
-    elif kind == "left":
-        z = f"{1 + S}"
-        x = f"(iw-iw/zoom)*{p}"
-    else:  # up
-        z = f"{1 + S}"
-        y = f"(ih-ih/zoom)*(1-{p})"
-    return (f"scale=2160:3840,zoompan=z='{z}':x='{x}':y='{y}':d={n}:s={W}x{H}:fps={FPS},"
-            f"format=yuv420p")
+        return 1 + S * p, 0.5, 0.5
+    if kind == "out":
+        return 1 + S - S * p, 0.5, 0.5
+    if kind == "left":
+        return 1 + S, p, 0.5
+    return 1 + S, 0.5, 1 - p     # up
+
+
+def paste_layer(frame, ly, t):
+    u = min(1.0, max(0.0, (t - ly["t0"]) / ly["dur"]))
+    im, x, y = ly["img"], ly["x"], ly["y"]
+    if ly["kind"] == "slide":        # плашка плавно выезжает снизу и проявляется
+        a = ease_out(u)
+        y += int(70 * (1 - a))
+    elif ly["kind"] == "pop":        # плашка «выскакивает» с лёгким отскоком
+        a = min(1.0, u * 2)
+        sc = 0.8 + 0.2 * ease_back(u)
+        w, h = im.size
+        nw, nh = max(1, int(w * sc)), max(1, int(h * sc))
+        im = im.resize((nw, nh), Image.BICUBIC)
+        x += (w - nw) // 2
+        y += (h - nh) // 2
+    else:                            # fade: фото плавно сменяется другим
+        a = ease_out(u)
+    if a < 0.999:
+        im = im.copy()
+        im.putalpha(im.getchannel("A").point(lambda v, a=a: int(v * a)))
+    frame.alpha_composite(im, (x, y))
+
+
+def render_clip(s, out):
+    """Рисует кадры сцены в Pillow и отправляет в ffmpeg."""
+    n = max(2, int(s["d"] * FPS))
+    base = Image.open(s["png"]).convert("RGBA")
+    layers = sorted(s.get("layers", []), key=lambda ly: ly["t0"])
+    proc = subprocess.Popen(
+        ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}",
+         "-r", str(FPS), "-i", "-", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+         "-pix_fmt", "yuv420p", out],
+        stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    white = Image.new("RGB", (W, H), "white")
+    try:
+        for i in range(n):
+            t = i / FPS
+            p = s["p0"] + (s["p1"] - s["p0"]) * i / (n - 1)
+            z, px, py = cam(s["motion"], s["S"], p)
+            frame = base
+            live = [ly for ly in layers if t >= ly["t0"]]
+            if live:
+                frame = base.copy()
+                for ly in live:
+                    paste_layer(frame, ly, t)
+            cw, ch = W / z, H / z
+            x0, y0 = (W - cw) * px, (H - ch) * py
+            f = frame.resize((W, H), Image.BICUBIC, box=(x0, y0, x0 + cw, y0 + ch)).convert("RGB")
+            if s["kind"] == "hook" and t < 0.35:      # вспышка в первую долю секунды
+                f = Image.blend(f, white, 1 - t / 0.35)
+            proc.stdin.write(f.tobytes())
+        proc.stdin.close()
+        if proc.wait() != 0:
+            raise RuntimeError("ffmpeg не смог собрать сцену")
+    except Exception:
+        proc.kill()
+        raise
 
 
 def render_video(scenes, subs):
@@ -687,12 +834,7 @@ def render_video(scenes, subs):
     clips = []
     for i, s in enumerate(scenes):
         clip = f"{WORK}/clip{i}.mp4"
-        frames = int(s["d"] * FPS)
-        vf = motion_vf(s["motion"], frames, s["S"], s["p0"], s["p1"])
-        if s["kind"] == "hook":
-            vf += ",fade=t=in:st=0:d=0.35:color=white"
-        run(["ffmpeg", "-y", "-i", s["png"], "-vf", vf, "-t", f"{s['d']:.3f}",
-             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", clip])
+        render_clip(s, clip)
         clips.append(clip)
 
     total = sum(s["d"] for s in scenes) - (n - 1) * T
@@ -729,23 +871,46 @@ def render_video(scenes, subs):
     return total
 
 
-def mix_audio(scenes, total, out):
+# ---------- звуки (SFX) ----------
+
+SFX_DEFS = {   # генерируются в ffmpeg; свои файлы кладутся в sfx/whoosh.mp3, sfx/pop.mp3 и т.д.
+    "whoosh": "aevalsrc='(0.5*(random(0)*2-1)+0.25*sin(2*PI*(300*t+1800*t*t)))*sin(PI*t/0.6)*sin(PI*t/0.6)'"
+              ":d=0.6:s=24000,highpass=f=250,lowpass=f=4800",
+    "pop": "aevalsrc='0.8*sin(2*PI*(700*t-1500*t*t))*exp(-22*t)':d=0.18:s=24000",
+    "tick": "aevalsrc='0.7*sin(2*PI*1700*t)*exp(-110*t)':d=0.1:s=24000",
+    "hit": "aevalsrc='0.9*sin(2*PI*(120*t-180*t*t))*exp(-7*t)+0.3*(random(0)*2-1)*exp(-45*t)'"
+           ":d=0.6:s=24000,lowpass=f=3500",
+    "ding": "aevalsrc='0.5*sin(2*PI*1319*t)*exp(-5*t)+0.3*sin(2*PI*1975*t)*exp(-7*t)"
+            "+0.15*sin(2*PI*2637*t)*exp(-9*t)':d=1.0:s=24000",
+}
+
+
+def sfx_file(kind):
+    for ext in ("mp3", "wav", "m4a", "ogg"):
+        p = f"sfx/{kind}.{ext}"
+        if os.path.exists(p):
+            return p
+    path = f"{WORK}/sfx_{kind}.wav"
+    if not os.path.exists(path):
+        run(["ffmpeg", "-y", "-f", "lavfi", "-i", SFX_DEFS[kind], "-ar", "24000", "-ac", "1", path])
+    return path
+
+
+def mix_audio(scenes, total, out, events):
+    """Голос + музыка + звуки. events: [(время_сек, 'whoosh'|'pop'|...)]."""
     silent = f"{WORK}/silent.mp4"
     T = TRANSITION
     voiced = [s for s in scenes if s.get("voice_d")]
     tracks = [t for ext in ("mp3", "m4a", "ogg", "wav") for t in glob.glob(f"music/*.{ext}")]
     track = random.choice(tracks) if tracks else None
-    if track:
-        print("  музыка:", os.path.basename(track))
-    else:
-        print("  папка music/ пуста, музыки не будет")
+    print("  музыка:", os.path.basename(track) if track else "папка music/ пуста, музыки не будет")
+    events = [(max(0.0, t), k) for t, k in events] if SFX_ON else []
 
-    if not voiced and not track:
+    if not voiced and not track and not events:
         shutil.copy(silent, out)
         return
     cmd = ["ffmpeg", "-y", "-i", silent]
-    fc = []
-    idx = 1
+    fc, labels, idx = [], [], 1
     if voiced:
         parts, cursor = [], 0.0
         for s in voiced:
@@ -761,18 +926,33 @@ def mix_audio(scenes, total, out):
             idx += 1
         fc.append("".join(parts) + f"concat=n={len(parts)}:v=0:a=1[v0]")
         fc.append(f"[v0]apad=whole_dur={total:.3f}[voice]")
+        labels.append("[voice]")
     if track:
         cmd += ["-stream_loop", "-1", "-i", track]
         vol = MUSIC_VOL_VOICE if voiced else MUSIC_VOL_PLAIN
         fc.append(f"[{idx}:a]volume={vol},afade=t=in:st=0:d=1,"
                   f"afade=t=out:st={max(0, total - 1.5):.2f}:d=1.5[mus]")
-    if voiced and track:
-        fc.append("[voice][mus]amix=inputs=2:duration=first:dropout_transition=0,volume=2,"
-                  "alimiter=limit=0.95[a]")
-    elif voiced:
-        fc.append("[voice]alimiter=limit=0.95[a]")
+        labels.append("[mus]")
+        idx += 1
+    if events:
+        evl = []
+        for t, kind in events:
+            cmd += ["-i", sfx_file(kind)]
+            fc.append(f"[{idx}:a]aresample=24000,aformat=channel_layouts=mono,"
+                      f"adelay=delays={int(t * 1000)}:all=1,volume={SFX_VOL}[e{idx}]")
+            evl.append(f"[e{idx}]")
+            idx += 1
+        if len(evl) == 1:
+            fc.append(f"{evl[0]}apad=whole_dur={total:.3f}[sfx]")
+        else:
+            fc.append("".join(evl) + f"amix=inputs={len(evl)}:normalize=0:duration=longest[sfx0]")
+            fc.append(f"[sfx0]apad=whole_dur={total:.3f}[sfx]")
+        labels.append("[sfx]")
+    if len(labels) == 1:
+        fc.append(f"{labels[0]}alimiter=limit=0.95[a]")
     else:
-        fc.append("[mus]anull[a]")
+        fc.append("".join(labels) + f"amix=inputs={len(labels)}:normalize=0:duration=longest,"
+                  "alimiter=limit=0.95[a]")
     cmd += ["-filter_complex", ";".join(fc), "-map", "0:v", "-map", "[a]", "-c:v", "copy",
             "-c:a", "aac", "-b:a", "160k", "-t", f"{total:.3f}", out]
     run(cmd)
@@ -786,16 +966,21 @@ async def build_short(items, hook, out):
         title = f"{ii + 1}. {it['name']}" if k > 1 else it["name"]
         a = it["imgs"][0].size
         ar0 = a[0] / a[1]    # берём только фото того же формата, что первое, иначе рамка будет некрасивой
-        it["imgs"] = [im for im in it["imgs"] if abs((im.size[0] / im.size[1]) / ar0 - 1) < 0.15]
-        it["L"] = compute_layout(title, it["bullets"], a[0] / a[1])
+        it["imgs"] = [im for im in it["imgs"] if abs((im.size[0] / im.size[1]) / ar0 - 1) < 0.2]
+        it["L"] = compute_layout(title, it["bullets"], ar0)
+        shots = pick_shots(it["name"], it["voices"], it["imgs"])
         for bi in range(len(it["bullets"])):
+            lst = shots[bi]
             plan.append(dict(kind="bullet", item=ii, stage=bi + 1, L=it["L"],
-                             img=it["imgs"][bi % len(it["imgs"])], text=it["voices"][bi], soft=bi > 0))
+                             img=it["imgs"][lst[0]],
+                             alt=it["imgs"][lst[1]] if len(lst) > 1 else None,
+                             text=it["voices"][bi], soft=bi > 0))
     last = items[-1]
     cta_text = ("Всё это бесплатно в Телеграме. Ссылка в шапке канала." if k > 1
                 else "Скачивай бесплатно в Телеграме. Ссылка в шапке канала.")
+    prev = plan[-1]
     plan.append(dict(kind="cta", item=k - 1, stage=len(last["bullets"]) + 1, L=last["L"],
-                     img=plan[-1]["img"], text=cta_text, soft=True))
+                     img=prev["alt"] or prev["img"], alt=None, text=cta_text, soft=True))
 
     # движение камеры: на один пост одно непрерывное движение, которое делится между его сценами
     for ii in range(k):
@@ -808,10 +993,14 @@ async def build_short(items, hook, out):
     voice_ok = VOICE_ON
     for si, s in enumerate(plan):
         s["png"] = f"{WORK}/scene{si}.png"
+        s["layers"] = []
         if s["kind"] == "hook":
             draw_hook([it["imgs"][0] for it in items], hook, s["png"])
         else:
-            draw_scene(s["L"], s["img"], s["stage"], s["png"])
+            ly = draw_scene(s["L"], s["img"], s["stage"], s["png"])
+            ly["t0"] = 0.15
+            s["layers"].append(ly)
+            s["anim"] = ly
         s["voice_d"], s["voice"] = 0.0, None
         if voice_ok:
             s["voice_d"], s["voice"] = await tts(s["text"], f"{WORK}/voice{si}.wav")
@@ -822,11 +1011,28 @@ async def build_short(items, hook, out):
                     p["voice_d"] = 0.0
         base = s["voice_d"] if s["voice_d"] else FALLBACK_DUR[s["kind"]]
         s["d"] = base + PAUSE + TRANSITION
+        if s["kind"] == "bullet" and s.get("alt") is not None:    # второе фото возникает на середине фразы
+            ly = photo_layer(s["L"], s["alt"])
+            ly["t0"] = TRANSITION / 2 + base * SWAP_AT
+            s["layers"].append(ly)
+            s["swap"] = ly["t0"]
 
     t = 0.0
     for s in plan:           # момент начала каждой сцены на итоговой шкале времени
         s["start"] = t
         t += s["d"] - TRANSITION
+
+    events = []              # звуки: (время, вид)
+    for si, s in enumerate(plan):
+        st = s["start"]
+        if s["kind"] == "hook":
+            events.append((st, "hit"))
+        else:
+            if not s["soft"]:
+                events.append((st - 0.05, "whoosh"))
+            events.append((st + s["anim"]["t0"] + 0.03, "ding" if s["kind"] == "cta" else "pop"))
+            if "swap" in s:
+                events.append((st + s["swap"], "tick"))
 
     subs = []
     if voice_ok:
@@ -844,7 +1050,7 @@ async def build_short(items, hook, out):
                 at += dur
 
     total = render_video(plan, subs)
-    mix_audio(plan, total, out)
+    mix_audio(plan, total, out, events)
     return total
 
 
