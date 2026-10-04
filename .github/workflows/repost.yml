@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: pip install telethon requests hachior 
+      - run: pip install telethon requests hachoir 
       - run: python repost.py
         env:
           API_ID: ${{ secrets.API_ID }}
