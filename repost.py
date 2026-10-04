@@ -1,5 +1,6 @@
 import os, re, json, time, asyncio, requests
 from collections import Counter
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -14,7 +15,7 @@ FOOTER = os.environ.get("FOOTER", "").strip()
 MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 MAX_PER_RUN = 10          # сколько постов опубликовать за один запуск
 MAX_AI_PER_RUN = 60       # сколько постов показать Gemini за один запуск (защита от слишком долгого запуска)
-FIRST_RUN_HOURS = 24    # история при первом запуске для нового канала (потом верни 24)
+FIRST_RUN_HOURS = 999     # история при первом запуске для нового канала (потом верни 24)
 SETTLE_MIN = 5            # свежие посты младше N минут ждут следующего запуска
 TARGET_SCAN = 1500        # сколько последних сообщений своего канала сканировать для защиты от дублей
 GEMINI_TRIES = 2          # попыток на каждую модель при ошибках 5xx
@@ -43,7 +44,8 @@ PROMPT = (
     "1) Название и версию игры (например «1.21.70+») сохрани точно.\n"
     "2) Суть и возможности переформулируй: тот же смысл, но другие слова и структура.\n"
     "3) Убери ссылки, @упоминания, названия чужих каналов, рекламу, призывы "
-    "подписаться, слова про комментарии, навигацию и переходники.\n"
+    "подписаться, слова про комментарии, навигацию и переходники, а также кнопки и призывы "
+    "вроде «Скачать» и указатели 👉👈: файлы мы прикладываем сами.\n"
     "4) Не больше 600 символов, 1-2 уместных эмодзи.\n"
     "5) В конце один хэштег по типу: #аддон, #мод, #текстурпак, #шейдер, #клиент, #чит, "
     "#постройка или #новости.\n\n"
@@ -276,20 +278,182 @@ def build_posts(msgs):
     return posts
 
 
+# ---------- файлы по ссылке «Скачать» (когда файлы лежат в другом канале) ----------
+
+DL_WORDS = re.compile(r"скач|download|загруз|файл|apk", re.I)
+
+
+def parse_tme(url):
+    """Разбор ссылки Telegram. Возвращает ('chan', канал, id_сообщения|None), ('invite',..), ('bot',..) или None."""
+    u = re.sub(r"^https?://", "", (url or "").strip(), flags=re.I)
+    m = re.match(r"(?:t|telegram)\.me/(.+)", u, flags=re.I)
+    if not m:
+        return None
+    parts = [x for x in re.split(r"[/?#]", m.group(1)) if x]
+    if not parts:
+        return None
+    head = parts[0]
+    if head.startswith("+") or head.lower() == "joinchat":
+        return ("invite", None, None)
+    nums = [int(x) for x in parts[1:] if x.isdigit()]
+    if head == "c":
+        if len(parts) >= 2 and parts[1].isdigit():
+            return ("chan", int("-100" + parts[1]), nums[-1] if len(nums) >= 2 else None)
+        return None
+    if head.lower().endswith("bot"):
+        return ("bot", None, None)
+    if not re.fullmatch(r"[A-Za-z]\w{3,}", head):
+        return None
+    return ("chan", head, nums[-1] if nums else None)
+
+
+def dl_links(p):
+    """Ссылки на скачивание в посте: ссылка на сообщение в канале или с подписью вроде «Скачать»."""
+    out, seen_u = [], set()
+    for m in p["msgs"]:
+        try:
+            ents = m.get_entities_text()
+        except Exception:
+            ents = []
+        for ent, txt in ents:
+            url = getattr(ent, "url", None) or (txt if type(ent).__name__ == "MessageEntityUrl" else None)
+            if not url or url in seen_u:
+                continue
+            seen_u.add(url)
+            kind = parse_tme(url)
+            anchor = txt or ""
+            if kind is None:
+                if DL_WORDS.search(anchor):
+                    out.append((url, anchor, ("external", None, None)))
+            elif kind[0] == "chan":
+                if kind[2] or DL_WORDS.search(anchor):   # ссылка на сообщение или «Скачать» на канал
+                    out.append((url, anchor, kind))
+            elif DL_WORDS.search(anchor):                # приглашение или бот с подписью «Скачать»
+                out.append((url, anchor, kind))
+    return out
+
+
+async def files_from_link(client, ent, mid):
+    """Файлы по ссылке на сообщение: само сообщение, его альбом или файлы, идущие под постом."""
+    ids = list(range(max(1, mid - 9), mid + 10))
+    msgs = [m for m in await client.get_messages(ent, ids=ids) if m]
+    tgt = next((m for m in msgs if m.id == mid), None)
+    if not tgt:
+        return []
+    if is_doc_file(tgt):
+        if tgt.grouped_id:
+            return [m for m in msgs if m.grouped_id == tgt.grouped_id and is_doc_file(m)]
+        return [tgt]
+    for pp in build_posts(msgs):
+        if any(m.id == mid for m in pp["msgs"]):
+            return [m for m in pp["msgs"] if is_doc_file(m)]
+    return []
+
+
+async def files_by_name(client, ent, p):
+    """Ссылка ведёт на канал целиком: ищем среди последних файлов канала тот, что подходит по названию."""
+    names = [stem(l) for l in (p["text"] or "").splitlines() if l.strip()][:4]
+    names = [n for n in names if len(n) >= 4]
+    if not names:
+        return []
+    best, best_s = None, 0.0
+    async for m in client.iter_messages(ent, limit=400):
+        if not is_doc_file(m):
+            continue
+        cap = next((l for l in (m.message or "").splitlines() if l.strip()), "")
+        for a in (stem(os.path.splitext(fname(m))[0]), stem(cap)):
+            if len(a) < 4:
+                continue
+            for b in names:
+                sc = SequenceMatcher(None, a, b).ratio()
+                if a in b or b in a:
+                    sc = max(sc, 0.9)
+                if sc > best_s:
+                    best, best_s = m, sc
+    if not best or best_s < 0.75:
+        return []
+    return await files_from_link(client, ent, best.id)
+
+
+async def resolve_files(client, p, cache):
+    """Статусы: nolink (скачивать нечего), ok (файлы найдены), unsupported (внешний сайт или бот),
+    missing (в канале не нашли), error (сбой, повторим позже)."""
+    links = dl_links(p)
+    if not links:
+        return "nolink", []
+    tg = [l for l in links if l[2][0] == "chan"]
+    if not tg:
+        return "unsupported", []
+    found, err, blocked = [], False, False
+    for url, anchor, (_, ref, mid) in tg:
+        try:
+            if ref not in cache:
+                cache[ref] = await client.get_entity(ref)
+            ent = cache[ref]
+            if getattr(ent, "noforwards", False):
+                blocked = True
+                print(f"  канал {ref}: запрет копирования, файлы не беру")
+                continue
+            got = await files_from_link(client, ent, mid) if mid else await files_by_name(client, ent, p)
+            found += got
+            await asyncio.sleep(1)
+        except Exception as e:
+            err = True
+            print(f"  ссылка {url}: {e}")
+    uniq, ids = [], set()
+    for m in found:
+        if m.document and m.document.id not in ids:
+            ids.add(m.document.id)
+            uniq.append(m)
+    if uniq:
+        return "ok", uniq
+    if blocked and not err:
+        return "unsupported", []
+    return ("error" if err else "missing"), []
+
+
 # ---------- отправка ----------
 
-async def send_media(client, target, medias, caption=None):
-    await client.send_file(target, medias[0] if len(medias) == 1 else medias, caption=caption)
+def is_protected(m, channel_protected=False):
+    """Пересылка запрещена в канале или у сообщения: файлы нужно скачивать и загружать заново."""
+    return bool(channel_protected or getattr(m, "noforwards", False))
 
 
-async def send_post(client, target, items, caption):
+async def send_media(client, target, msgs, caption=None, force_download=False):
+    if not force_download:
+        try:
+            medias = [m.media for m in msgs]
+            await client.send_file(target, medias[0] if len(medias) == 1 else medias, caption=caption)
+            return
+        except Exception as e:  # например, пересылка запрещена: скачиваем и грузим заново
+            print("  прямая отправка не удалась, скачиваю и загружаю заново:", e)
+    os.makedirs("tmp", exist_ok=True)
+    paths = []
+    try:
+        for m in msgs:
+            pth = await client.download_media(m, file="tmp/")
+            if not pth:
+                raise RuntimeError("не удалось скачать файл")
+            paths.append(pth)
+        await client.send_file(target, paths[0] if len(paths) == 1 else paths, caption=caption,
+                               supports_streaming=True)
+    finally:
+        for pth in paths:
+            try:
+                os.remove(pth)
+            except Exception:
+                pass
+
+
+async def send_post(client, target, items, caption, protected=False):
     previews = [m for m in items if is_preview(m)]
     files = [m for m in items if not is_preview(m)]
     first = True
     for group in (previews, files):  # фото и видео отдельным альбомом, файлы отдельным
         for i in range(0, len(group), 10):
             chunk = group[i:i + 10]
-            await send_media(client, target, [m.media for m in chunk], caption if first else None)
+            force = any(is_protected(m, protected) for m in chunk)
+            await send_media(client, target, chunk, caption if first else None, force_download=force)
             first = False
     if first:  # медиа нет: обычный текстовый пост
         await client.send_message(target, caption)
@@ -334,12 +498,19 @@ async def main():
             # 2) собираем посты со всех каналов
             collected = []
             max_ids = {}
+            protected_src = {}
             for src in SOURCES:
                 try:
                     entity = await client.get_entity(src)
                 except Exception as e:
                     print(f"[{src}] не удалось открыть канал: {e}")
                     continue
+                if getattr(entity, "noforwards", False):
+                    print(f"[{src}] у канала включён запрет копирования, владелец не разрешил, пропускаю")
+                    continue
+                protected_src[src] = bool(getattr(entity, "noforwards", False))
+                if protected_src[src]:
+                    print(f"[{src}] пересылка запрещена: файлы буду скачивать и загружать заново")
                 last = state.get(src, 0)
                 if last:
                     it = client.iter_messages(entity, min_id=last, reverse=True)
@@ -363,6 +534,7 @@ async def main():
             settle = datetime.now(timezone.utc) - timedelta(minutes=SETTLE_MIN)
             pending = {}
             stop = False
+            chan_cache = {}
 
             for src, p in collected:
                 key = f"{src}:{p['first']}"
@@ -381,6 +553,27 @@ async def main():
                     continue
                 if f"p{key}" in seen_set:  # ИИ уже решил пропустить этот пост раньше
                     continue
+
+                # файлы по ссылке «Скачать»: если под постом файлов нет, а ссылка ведёт в другой канал
+                if not any(is_doc_file(m) for m in p["msgs"]):
+                    st, extra = await resolve_files(client, p, chan_cache)
+                    if st == "ok":
+                        p["msgs"] = p["msgs"] + extra
+                        print(tag, f"файлов по ссылке найдено: {len(extra)}")
+                    elif st == "unsupported":
+                        remember([f"p{key}"])
+                        print(tag, "файл недоступен (внешний сайт, бот или канал с запретом копирования), пост пропущен")
+                        continue
+                    elif st in ("missing", "error"):
+                        fails[key] = fails.get(key, 0) + 1
+                        if fails[key] >= MAX_FAILS:
+                            remember([f"p{key}"])
+                            print(tag, "файл по ссылке не найден, пост пропущен навсегда")
+                        else:
+                            print(tag, f"файл по ссылке не найден (попытка {fails[key]}/{MAX_FAILS}), "
+                                       "повторю в следующий запуск")
+                            hold(pending, src, p)
+                        continue
 
                 # локальная проверка на дубли (до обращения к Gemini)
                 orig_media = any(has_media(m) for m in p["msgs"])
@@ -425,7 +618,7 @@ async def main():
                     continue
 
                 try:
-                    await send_post(client, target, items, caption)
+                    await send_post(client, target, items, caption, protected_src.get(src, False))
                 except Exception as e:
                     print(tag, "ошибка отправки:", e)
                     hold(pending, src, p)
@@ -448,4 +641,5 @@ async def main():
     print(f"Всего отправлено: {sent}, дублей: {dups}, отклонено ИИ: {skipped_ai}, запросов к ИИ: {ai_calls}")
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
