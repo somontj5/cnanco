@@ -1,4 +1,4 @@
-import os, io, base64, re, json, glob, random, shutil, subprocess, asyncio, time, requests
+import os, io, base64, re, json, glob, urllib.parse, random, shutil, subprocess, asyncio, time, requests
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance, ImageOps
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -28,6 +28,8 @@ VOICE_ON = True                                   # False = ролик без г
 VOICE = os.environ.get("TTS_VOICE", "").strip() or "ru-RU-DmitryNeural"   # мужской; женский: ru-RU-SvetlanaNeural
 VOICE_RATE = "+10%"                               # скорость речи: "+0%" обычная, "+15%" бодрее
 MUSIC_VOL_VOICE = 0.12                            # громкость музыки под голосом (0.0-1.0)
+POLL_KEY = os.environ.get("POLLINATIONS_KEY", "").strip()   # бесплатный ключ с enter.pollinations.ai (без него ограничения)
+GEN_MAX = 4                                       # сколько картинок генерировать на один ролик (только если реальных фото мало)
 SFX_ON = True                                     # звуки: свист, щелчок, удар. False = без звуков
 SFX_VOL = 0.45                                    # громкость звуков (0.0-1.0)
 SWAP_AT = 0.5                                     # на какой доле фразы появляется второе фото
@@ -140,13 +142,15 @@ def script_prompt(label, k, per_item, posts_text):
         "Не повторяй пункт дословно, добавляй, зачем это игроку.\n"
         "3. ВАЖНО: после hook зритель сразу слышит первый пост. Не повторяй и не пересказывай hook, "
         "не начинай фразы словами «слушай», «смотри», «представь», без вступлений и приветствий.\n"
+        "   art: ровно столько же коротких описаний на АНГЛИЙСКОМ (до 18 слов): что нарисовать к каждой фразе "
+        "(предмет, моб или постройка из текста). Это иллюстрации в стиле Minecraft, без текста и надписей.\n"
         "4. В hook и voice все иностранные слова пиши русскими буквами, как слышатся "
         "(Minecraft = Майнкрафт, Add-On = аддон).\n"
         "5. yt_title: до 90 символов, цепляющий, с числом или интригой и словом Minecraft, без обмана.\n\n"
 
         "Верни ТОЛЬКО JSON без пояснений:\n"
         '{"hook": "...",\n'
-        ' "items": [{"name": "...", "bullets": ["..."], "voice": ["..."]}],\n'
+        ' "items": [{"name": "...", "bullets": ["..."], "voice": ["..."], "art": ["..."]}],\n'
         ' "yt_title": "...",\n'
         ' "yt_description": "2-3 предложения: что в подборке, призыв скачать бесплатно в Telegram, '
         'ссылка в шапке канала; в конце хэштеги #Shorts #Minecraft и ещё 2-3 по теме"}\n\n'
@@ -500,28 +504,51 @@ def photo_layer(L, img):
     return dict(img=pb, x=L["px"], y=L["photo_y"] + 8, kind="fade", dur=0.4)
 
 
+def pack_tiles(aspects, box_w, room, gap, cap_h):
+    """Выбирает раскладку фото (столбик, ряд, 1+2 и т.д.), при которой фото получаются самыми крупными.
+    Возвращает список рядов: [(индекс, ширина, высота), ...] с внешними размерами (вместе с рамкой)."""
+    k = len(aspects)
+    layouts = {1: [[[0]]], 2: [[[0], [1]], [[0, 1]]],
+               3: [[[0], [1], [2]], [[0, 1, 2]], [[0], [1, 2]], [[0, 1], [2]]]}.get(k, [[[i] for i in range(k)]])
+    best, best_area = None, -1
+    for lay in layouts:
+        rows = []
+        for row in lay:
+            wsum = sum(aspects[i] for i in row)
+            h = (box_w - gap * (len(row) - 1)) / wsum        # высота ряда, если растянуть на всю ширину
+            rows.append((row, min(h, cap_h)))
+        total = sum(h for _, h in rows) + gap * (len(rows) - 1)
+        sc = min(1.0, (room - 0) / total)
+        out, area = [], 0
+        for row, h in rows:
+            h *= sc
+            out.append([(i, int(h * aspects[i]), int(h)) for i in row])
+            area += sum(int(h * aspects[i]) * int(h) for i in row)
+        if area > best_area:
+            best, best_area = out, area
+    return best
+
+
 def draw_hook(imgs, hook, out_png):
-    """Заставка: крупная зацепка на жёлтой плашке + фото постов друг под другом, каждое в своей рамке."""
+    """Заставка: крупная зацепка на жёлтой плашке + фото постов крупной сеткой, каждое в своей рамке."""
     canvas = make_bg(imgs[0])
     CW, PAD, GAP, TG, FR = COLUMN_W, 44, 36, 14, 8
     X0 = (W - CW) // 2
     m = ImageDraw.Draw(canvas)
-    f, lines, size = fit_lines(m, hook.upper(), "title", 104, CW - 2 * PAD, 5, 44)
+    text_up = hook.upper()
+    f, lines, size = fit_lines(m, text_up, "title", 92, CW - 2 * PAD, 4, 56)   # плашка не выше 4 строк, чтобы осталось место фото
+    if len(wrap(m, text_up, f, CW - 2 * PAD)) > 4:                              # очень длинная зацепка: допускаем 5 строк
+        f, lines, size = fit_lines(m, text_up, "title", 80, CW - 2 * PAD, 5, 44)
     lh = int(size * 1.2)
     plate_h = len(lines) * lh + 2 * PAD
     avail = (H - SAFE_BOTTOM) - SAFE_TOP
     room = avail - plate_h - GAP
 
     box_w = CW - 24
-    sizes = []
-    for im in imgs:
-        ar = im.size[0] / im.size[1]
-        h = min(box_w / ar, 520 if len(imgs) > 1 else 800)
-        sizes.append([h * ar, h, ar])
-    total = sum(h + 2 * FR for _, h, _ in sizes) + TG * (len(imgs) - 1)
-    k = min(1.0, room / total)
-    sizes = [(int(w * k), int(h * k)) for w, h, _ in sizes]
-    stack_h = sum(h + 2 * FR for _, h in sizes) + TG * (len(imgs) - 1)
+    aspects = [im.size[0] / im.size[1] for im in imgs]
+    # внешние размеры включают рамку: считаем с запасом, потом вычитаем 2*FR
+    rows = pack_tiles(aspects, box_w, room, TG, 760 if len(imgs) == 1 else 640)
+    stack_h = sum(max(h for _, _, h in row) for row in rows) + TG * (len(rows) - 1)
     y = SAFE_TOP + max(0, (avail - (plate_h + GAP + stack_h)) // 2)
 
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -531,14 +558,18 @@ def draw_hook(imgs, hook, out_png):
     plate_y = y
     y += plate_h + GAP
     spots = []
-    for (w, h) in sizes:
-        x = (W - w) // 2
-        od.rounded_rectangle((x - FR, y, x + w + FR, y + h + 2 * FR), radius=30, fill=(255, 255, 255, 235))
-        spots.append((x, y + FR, w, h))
-        y += h + 2 * FR + TG
+    for row in rows:
+        row_w = sum(w for _, w, _ in row) + TG * (len(row) - 1)
+        x = (W - row_w) // 2
+        rh = max(h for _, _, h in row)
+        for i, w, h in row:
+            od.rounded_rectangle((x, y, x + w, y + h), radius=30, fill=(255, 255, 255, 235))
+            spots.append((i, x + FR, y + FR, max(40, w - 2 * FR), max(40, h - 2 * FR)))
+            x += w + TG
+        y += rh + TG
     canvas = Image.alpha_composite(canvas, overlay)
-    for im, (x, yy, w, h) in zip(imgs, spots):
-        pb, mask = photo_box(im, w, h, radius=24)
+    for i, x, yy, w, h in spots:
+        pb, mask = photo_box(imgs[i], w, h, radius=24)
         canvas.paste(pb, (x, yy), mask)
     d = ImageDraw.Draw(canvas)
     for i, ln in enumerate(lines):
@@ -695,6 +726,90 @@ async def tts(text, path):
 
 
 # ---------- видео ----------
+
+# ---------- генерация иллюстраций (Pollinations) ----------
+
+_gen_off = [False]     # после ошибки ключа или нехватки pollen генерацию в этом запуске отключаем
+_models_shown = [False]
+_good_model = [None]    # имя модели, которое сервис уже принял
+
+
+def _show_models():
+    """При сбое один раз печатает список доступных моделей картинок (этот запрос ключа не требует)."""
+    if _models_shown[0]:
+        return
+    _models_shown[0] = True
+    try:
+        r = requests.get("https://gen.pollinations.ai/image/models", timeout=30)
+        names = []
+        for m in (r.json() if r.status_code == 200 else []):
+            names.append(m.get("name") or m.get("id") or str(m)[:40]) if isinstance(m, dict) else names.append(str(m))
+        print("  доступные модели картинок:", ", ".join(names[:20]) or f"HTTP {r.status_code}")
+    except Exception as e:
+        print("  список моделей не получен:", e)
+
+
+def _is_image(r):
+    return r.status_code == 200 and r.headers.get("content-type", "").startswith("image") and len(r.content) > 3000
+
+
+def gen_image(prompt, ar):
+    """Рисует иллюстрацию в стиле Minecraft через Pollinations. Возвращает картинку или None."""
+    if _gen_off[0]:
+        return None
+    w = 1024
+    h = int(max(512, min(1536, w / ar)) // 16 * 16)
+    q = urllib.parse.quote(f"{prompt}, Minecraft style, blocky voxel art, vibrant colors, clean render, "
+                           "no text, no letters, no watermark")
+    seed = random.randint(1, 10 ** 6)
+
+    if not POLL_KEY:   # без ключа сервис, скорее всего, не работает: пробуем один раз старый адрес
+        try:
+            r = requests.get(f"https://image.pollinations.ai/prompt/{q}?width={w}&height={h}&model=flux"
+                             f"&seed={seed}&nologo=true", timeout=120)
+            if _is_image(r):
+                im = Image.open(io.BytesIO(r.content)).convert("RGB")
+                im.load()
+                print("  картинка нарисована (без ключа)")
+                return im
+            print(f"  генерация без ключа не сработала (HTTP {r.status_code}): добавь секрет POLLINATIONS_KEY")
+        except Exception as e:
+            print("  генерация без ключа:", e)
+        _gen_off[0] = True
+        return None
+
+    names = ["flux", "black-forest-labs/flux.1-schnell"]    # старое короткое имя и новое полное
+    if _good_model[0]:
+        names.sort(key=lambda n: n != _good_model[0])
+    for mdl in names:
+        url = (f"https://gen.pollinations.ai/image/{q}?width={w}&height={h}&seed={seed}"
+               f"&model={urllib.parse.quote(mdl, safe='')}")
+        try:
+            r = requests.get(url, headers={"Authorization": f"Bearer {POLL_KEY}"}, timeout=120)
+        except Exception as e:
+            print(f"  Pollinations ({mdl}): {e}")
+            continue
+        if _is_image(r):
+            im = Image.open(io.BytesIO(r.content)).convert("RGB")
+            im.load()
+            _good_model[0] = mdl
+            print(f"  картинка нарисована (модель {mdl})")
+            return im
+        body = "" if r.headers.get("content-type", "").startswith("image") else r.text[:200].replace("\n", " ")
+        print(f"  Pollinations ({mdl}): HTTP {r.status_code} {body}")
+        if r.status_code in (401, 403):
+            print("  ключ не принят: проверь секрет POLLINATIONS_KEY (нужен ключ sk_..., не pk_...)")
+            _gen_off[0] = True
+            return None
+        if r.status_code == 402:
+            print("  на аккаунте Pollinations закончились pollen: проверь баланс на enter.pollinations.ai")
+            _gen_off[0] = True
+            return None
+        if r.status_code == 429:
+            time.sleep(10)
+    _show_models()
+    return None
+
 
 # ---------- подбор фото по смыслу (Gemini смотрит на картинки) ----------
 
@@ -962,13 +1077,27 @@ async def build_short(items, hook, out):
     """items: [{name, imgs, bullets, voices}]. Собирает ролик-подборку. Возвращает длительность."""
     k = len(items)
     plan = [dict(kind="hook", text=hook, soft=False, item=-1)]
+    gen_used = [0]
     for ii, it in enumerate(items):
         title = f"{ii + 1}. {it['name']}" if k > 1 else it["name"]
         a = it["imgs"][0].size
         ar0 = a[0] / a[1]    # берём только фото того же формата, что первое, иначе рамка будет некрасивой
         it["imgs"] = [im for im in it["imgs"] if abs((im.size[0] / im.size[1]) / ar0 - 1) < 0.2]
         it["L"] = compute_layout(title, it["bullets"], ar0)
-        shots = pick_shots(it["name"], it["voices"], it["imgs"])
+        gen_idx = {}
+        if len(it["imgs"]) < 2 and gen_used[0] < GEN_MAX:     # реальных фото мало: дорисовываем иллюстрации
+            for bi, prompt in enumerate(it.get("art", [])[:len(it["bullets"])]):
+                if gen_used[0] >= GEN_MAX:
+                    break
+                gim = gen_image(prompt, ar0)
+                if gim:
+                    it["imgs"].append(gim)
+                    gen_idx[bi] = len(it["imgs"]) - 1
+                    gen_used[0] += 1
+        if gen_idx:   # главное фото всегда реальное, иллюстрация только как вставка
+            shots = [[0, gen_idx[bi]] if bi in gen_idx else [0] for bi in range(len(it["bullets"]))]
+        else:
+            shots = pick_shots(it["name"], it["voices"], it["imgs"])
         for bi in range(len(it["bullets"])):
             lst = shots[bi]
             plan.append(dict(kind="bullet", item=ii, stage=bi + 1, L=it["L"],
@@ -1109,9 +1238,11 @@ async def main():
                         voices = [clean(v)[:150] for v in (it.get("voice") or []) if clean(v)]
                         while len(voices) < len(bullets):
                             voices.append(bullets[len(voices)])
+                        art = [re.sub(r"[^A-Za-z0-9 ,.'-]", "", a)[:160] for a in (it.get("art") or [])
+                               if isinstance(a, str)]
                         items.append(dict(name=clean(it["name"])[:38] or "Minecraft",
                                           imgs=[Image.open(x).convert("RGB") for x in paths],
-                                          bullets=bullets, voices=voices[:len(bullets)]))
+                                          bullets=bullets, voices=voices[:len(bullets)], art=art))
                     hook = clean(data["hook"])[:80]
 
                     out = f"{WORK}/short.mp4"
