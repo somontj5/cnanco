@@ -1,4 +1,4 @@
-import os, io, base64, re, json, glob, urllib.parse, random, shutil, subprocess, asyncio, time, requests
+import os, io, base64, re, json, glob, urllib.parse, random, shutil, subprocess, asyncio, time, wave, datetime, requests
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance, ImageOps
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -30,6 +30,12 @@ VOICE_RATE = "+10%"                               # скорость речи: "
 MUSIC_VOL_VOICE = 0.12                            # громкость музыки под голосом (0.0-1.0)
 POLL_KEY = os.environ.get("POLLINATIONS_KEY", "").strip()   # бесплатный ключ с enter.pollinations.ai (без него ограничения)
 GEN_MAX = 4                                       # сколько картинок генерировать на один ролик (только если реальных фото мало)
+TTS_ENGINE = os.environ.get("TTS_ENGINE", "").strip().lower() or "gemini"   # gemini = голос Gemini TTS, edge = голос Microsoft
+GEMINI_VOICE = os.environ.get("GEMINI_VOICE", "").strip() or "Puck"          # Puck (бодрый), Fenrir (азартный), Charon (диктор), Kore (твёрдый), Leda (молодой)
+GEMINI_TTS_STYLE = os.environ.get("GEMINI_TTS_STYLE", "").strip() or "upbeat, energetic, friendly storyteller"
+# Порядок моделей озвучки. У каждой бесплатно 10 запросов в сутки, на один ролик уходит 1 запрос.
+GEMINI_TTS_MODELS = ["gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts", "gemini-3.1-flash-tts-preview",
+                     "gemini-2.5-flash-preview-tts"]
 SFX_ON = True                                     # звуки: свист, щелчок, удар. False = без звуков
 SFX_VOL = 0.45                                    # громкость звуков (0.0-1.0)
 SWAP_AT = 0.5                                     # на какой доле фразы появляется второе фото
@@ -725,6 +731,152 @@ async def tts(text, path):
     return 0.0, None
 
 
+# ---------- озвучка Gemini TTS: весь сценарий одним запросом ----------
+
+tts_state = {"block": {}}      # модель -> дата (по тихоокеанскому времени), когда она исчерпала суточный лимит
+
+
+class DailyQuota(Exception):
+    pass
+
+
+def pacific_today():
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.datetime.now(ZoneInfo("America/Los_Angeles")).date().isoformat()
+    except Exception:
+        return (datetime.datetime.utcnow() - datetime.timedelta(hours=8)).date().isoformat()
+
+
+def pcm_to_wav(pcm, path, rate=24000):
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+
+
+def gemini_tts_call(model, text, out_wav):
+    """Один запрос к Gemini TTS. Сохраняет WAV. Бросает DailyQuota, если исчерпан суточный лимит модели."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    if model.startswith("gemini-3.8"):   # новая схема: стиль отдельно от текста
+        body = {"contents": [{"role": "user", "parts": [{"text": text,
+                                                         "speech_metadata": {"style": GEMINI_TTS_STYLE}}]}],
+                "generationConfig": {"responseModalities": ["AUDIO"],
+                                     "speechConfig": {"voiceConfig": {"voice": GEMINI_VOICE}}}}
+    else:                                # старые модели: стиль словами перед текстом
+        body = {"contents": [{"parts": [{"text": f"Say in an {GEMINI_TTS_STYLE} way: {text}"}]}],
+                "generationConfig": {"responseModalities": ["AUDIO"],
+                                     "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig":
+                                                                       {"voiceName": GEMINI_VOICE}}}}}
+    for attempt in (1, 2):
+        r = requests.post(url, headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=180)
+        if r.status_code == 429:
+            low = r.text.lower()
+            if "perday" in low or "per day" in low or "daily" in low:
+                raise DailyQuota(model)
+            if attempt == 1:                  # минутный лимит: ждём и пробуем ещё раз
+                print(f"  {model}: лимит в минуту, жду 25 сек")
+                time.sleep(25)
+                continue
+            raise DailyQuota(model)
+        if r.status_code >= 500 and attempt == 1:
+            time.sleep(6)
+            continue
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code} {r.text[:200]}")
+        break
+    part = r.json()["candidates"][0]["content"]["parts"][0]["inlineData"]
+    data = base64.b64decode(part["data"])
+    if data[:4] == b"RIFF":
+        open(out_wav, "wb").write(data)
+    else:                                     # сырой PCM без заголовка
+        m = re.search(r"rate=(\d+)", part.get("mimeType", ""))
+        pcm_to_wav(data, out_wav, int(m.group(1)) if m else 24000)
+    return out_wav
+
+
+def find_pauses(wav):
+    """Паузы в аудио: [(начало, конец)] и общая длительность."""
+    total = probe(wav)
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-i", wav, "-af", "silencedetect=noise=-38dB:d=0.22",
+                        "-f", "null", "-"], capture_output=True, text=True)
+    gaps, start = [], None
+    for line in r.stderr.splitlines():
+        m1 = re.search(r"silence_start: ([\d.]+)", line)
+        m2 = re.search(r"silence_end: ([\d.]+)", line)
+        if m1:
+            start = float(m1.group(1))
+        elif m2 and start is not None:
+            gaps.append((start, float(m2.group(1))))
+            start = None
+    return gaps, total
+
+
+def split_by_pauses(wav, texts, work_prefix):
+    """Режет озвучку на len(texts) сцен по самым длинным паузам. Возвращает [(длительность, файл)] или None."""
+    n = len(texts)
+    gaps, total = find_pauses(wav)
+    inner = [g for g in gaps if g[0] > 0.3 and total - g[1] > 0.15]
+    if len(inner) < n - 1:
+        print(f"  в озвучке нашлось {len(inner)} пауз из {n - 1} нужных")
+        return None
+    top = sorted(sorted(inner, key=lambda g: g[1] - g[0], reverse=True)[:n - 1])
+    cuts = [0.0] + [(a + b) / 2 for a, b in top] + [total]
+    chars = [max(1, len(t)) for t in texts]
+    speech = total - sum(b - a for a, b in top)
+    rate = speech / sum(chars)
+    out = []
+    for i in range(n):
+        dur = cuts[i + 1] - cuts[i]
+        exp = chars[i] * rate
+        if dur < 0.5 or not (0.4 < dur / max(exp, 0.1) < 3.0):
+            print(f"  сцена {i + 1}: длительность {dur:.1f} с не похожа на ожидаемую {exp:.1f} с, нарезка отклонена")
+            return None
+        seg, fin = f"{work_prefix}seg{i}.wav", f"{work_prefix}voice{i}.wav"
+        run(["ffmpeg", "-y", "-i", wav, "-ss", f"{cuts[i]:.3f}", "-to", f"{cuts[i + 1]:.3f}",
+             "-ar", "24000", "-ac", "1", seg])
+        trim_silence(seg, fin)
+        d = probe(fin)
+        if d < 0.3:
+            return None
+        out.append((d, fin))
+    return out
+
+
+async def gemini_tts_batch(texts):
+    """Озвучивает весь сценарий ОДНИМ запросом (так укладываемся в лимит 10 запросов в сутки на модель)
+    и режет на сцены. Возвращает [(длительность, файл)] или None, тогда включается запасной голос."""
+    if TTS_ENGINE != "gemini" or not GEMINI_KEY:
+        return None
+    today = pacific_today()
+    prepared = [tts_prep(t) for t in texts]
+    tried = 0
+    for model in GEMINI_TTS_MODELS:
+        if tts_state["block"].get(model) == today:
+            continue
+        if tried >= 2:                       # не жжём лимиты: максимум две модели на ролик
+            break
+        sep = " <long pause> " if model.startswith("gemini-3.8") else "\n\n"
+        text = sep.join(prepared)
+        tried += 1
+        try:
+            full = gemini_tts_call(model, text, f"{WORK}/gtts_full.wav")
+        except DailyQuota:
+            tts_state["block"][model] = today
+            print(f"  {model}: суточный лимит исчерпан, переключаюсь")
+            tried -= 1
+            continue
+        except Exception as e:
+            print(f"  {model}: {e}")
+            continue
+        parts = split_by_pauses(full, prepared, f"{WORK}/g_")
+        if parts:
+            print(f"  озвучка: {model}, голос {GEMINI_VOICE}, запрос 1, сцен {len(parts)}")
+            return parts
+    return None
+
+
 # ---------- видео ----------
 
 # ---------- генерация иллюстраций (Pollinations) ----------
@@ -1120,6 +1272,9 @@ async def build_short(items, hook, out):
     plan[0].update(motion="in", S=0.05, p0=0.0, p1=1.0)
 
     voice_ok = VOICE_ON
+    pre = await gemini_tts_batch([x["text"] for x in plan]) if VOICE_ON else None
+    if VOICE_ON and not pre:
+        print("  Gemini TTS не сработал, использую запасной голос Microsoft")
     for si, s in enumerate(plan):
         s["png"] = f"{WORK}/scene{si}.png"
         s["layers"] = []
@@ -1131,7 +1286,9 @@ async def build_short(items, hook, out):
             s["layers"].append(ly)
             s["anim"] = ly
         s["voice_d"], s["voice"] = 0.0, None
-        if voice_ok:
+        if voice_ok and pre:
+            s["voice_d"], s["voice"] = pre[si]
+        elif voice_ok:
             s["voice_d"], s["voice"] = await tts(s["text"], f"{WORK}/voice{si}.wav")
             if not s["voice_d"]:
                 print("  озвучка недоступна, делаю ролик без голоса")
@@ -1193,6 +1350,7 @@ async def main():
     fails = state.get("fails", {})
     types = state.get("types", {})
     last_type = state.get("last_type", "")
+    tts_state["block"] = state.get("tts_block", {})
     done = 0
     try:
         async with TelegramClient(StringSession(SESSION), API_ID, API_HASH) as client:
@@ -1287,6 +1445,8 @@ async def main():
         state["fails"] = fails
         state["types"] = dict(list(types.items())[-3000:])
         state["last_type"] = last_type
+        today = pacific_today()
+        state["tts_block"] = {m: d for m, d in tts_state["block"].items() if d == today}
         json.dump(state, open(STATE, "w"))
     print("Готово, роликов:", done)
 
