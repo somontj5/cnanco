@@ -6,7 +6,7 @@ on:
 permissions:
   contents: write
 concurrency:
-  group: shorts
+  group: telegram-session   # общая очередь: все боты с одним аккаунтом Telegram идут по одному
   cancel-in-progress: false
 jobs:
   run:
