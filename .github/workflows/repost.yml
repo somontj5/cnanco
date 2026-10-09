@@ -6,7 +6,7 @@ on:
 permissions:
   contents: write
 concurrency:
-  group: repost
+  group: telegram-session
   cancel-in-progress: false
 jobs:
   run:
