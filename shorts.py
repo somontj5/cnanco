@@ -36,6 +36,7 @@ GEMINI_TTS_STYLE = os.environ.get("GEMINI_TTS_STYLE", "").strip() or "upbeat, en
 # Порядок моделей озвучки. У каждой бесплатно 10 запросов в сутки, на один ролик уходит 1 запрос.
 GEMINI_TTS_MODELS = ["gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts", "gemini-3.1-flash-tts-preview",
                      "gemini-2.5-flash-preview-tts"]
+REQUIRE_VOICE = True      # True: ролик без голоса не публикуется (попробуем в следующий запуск), False: публиковать с музыкой
 SFX_ON = True                                     # звуки: свист, щелчок, удар. False = без звуков
 SFX_VOL = 0.45                                    # громкость звуков (0.0-1.0)
 SWAP_AT = 0.5                                     # на какой доле фразы появляется второе фото
@@ -164,16 +165,61 @@ def script_prompt(label, k, per_item, posts_text):
     )
 
 
+def _as_list(x):
+    if isinstance(x, str):
+        return [x] if x.strip() else []
+    if isinstance(x, list):
+        return [i if isinstance(i, str) else (i.get("text") or i.get("name") or "" if isinstance(i, dict) else str(i))
+                for i in x if i]
+    return []
+
+
+def normalize_script(d):
+    """Приводит ответ Gemini к ожидаемому виду: терпимо к другим названиям полей и к строке вместо списка."""
+    if not isinstance(d, dict):
+        return d
+    d["hook"] = (d.get("hook") or d.get("title") or d.get("intro") or "").strip() \
+        if isinstance(d.get("hook") or d.get("title") or d.get("intro") or "", str) else ""
+    items = d.get("items")
+    if not isinstance(items, list):
+        items = next((d[k] for k in ("posts", "videos", "entries", "list") if isinstance(d.get(k), list)), None)
+    norm = []
+    for it in (items if isinstance(items, list) else []):
+        if not isinstance(it, dict):
+            continue
+        norm.append(dict(
+            name=str(it.get("name") or it.get("title") or "").strip(),
+            bullets=[x for x in _as_list(it.get("bullets") or it.get("points") or it.get("facts")) if str(x).strip()],
+            voice=[x for x in _as_list(it.get("voice") or it.get("voiceover") or it.get("narration")) if str(x).strip()],
+            art=[x for x in _as_list(it.get("art") or it.get("images")) if str(x).strip()]))
+    d["items"] = norm
+    d["yt_title"] = d.get("yt_title") if isinstance(d.get("yt_title"), str) else ""
+    d["yt_description"] = d.get("yt_description") if isinstance(d.get("yt_description"), str) else ""
+    return d
+
+
+def script_problem(d, k):
+    """None, если сценарий годится. Годится, если нужное число постов или хотя бы первые из них (с названием и пунктами)."""
+    if not isinstance(d, dict):
+        return "ответ не объект JSON"
+    if not d.get("hook"):
+        return "нет поля hook"
+    items = d.get("items") or []
+    good = 0
+    for it in items[:k]:
+        if it["name"] and it["bullets"]:
+            good += 1
+        else:
+            break
+    if good == 0:
+        return f"нет ни одного готового поста (пришло {len(items)} из {k}; у первого пусты: " \
+               f"{'название' if items and not items[0]['name'] else 'пункты'})" if items else "нет списка items"
+    d["items"] = items[:good]          # лишнее и битое с конца отбрасываем
+    return None
+
+
 def valid_script(d, k):
-    try:
-        if not (isinstance(d, dict) and d.get("hook") and isinstance(d.get("items"), list)):
-            return False
-        if len(d["items"]) != k:
-            return False
-        return all(it.get("name") and isinstance(it.get("bullets"), list) and it["bullets"]
-                   for it in d["items"])
-    except Exception:
-        return False
+    return script_problem(normalize_script(d), k) is None
 
 
 # ---------- Gemini ----------
@@ -210,17 +256,31 @@ def gemini_raw(prompt, check, images=None):
                 print(f"  Gemini {model}: HTTP {r.status_code}, попытка {attempt}/2")
                 time.sleep(5)
                 continue
+            why, raw = "", ""
             try:
                 parts = r.json()["candidates"][0]["content"]["parts"]
                 raw = "".join(p.get("text", "") for p in parts if not p.get("thought"))
                 raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.M).strip()
-                data = json.loads(raw)
+                try:
+                    data = json.loads(raw, strict=False)
+                except ValueError:                       # лишний текст вокруг JSON: берём от { до }
+                    data = json.loads(raw[raw.index("{"):raw.rindex("}") + 1], strict=False)
                 if check(data):
                     print(f"  Gemini {model}: OK")
                     return data
+                why = "ответ не прошёл проверку"
+            except Exception as e:
+                why = f"{type(e).__name__}: {e}"
+            fin = ""
+            try:
+                fin = r.json()["candidates"][0].get("finishReason", "")
             except Exception:
                 pass
-            print(f"  Gemini {model}: неверный ответ: {r.text[:150]}")
+            print(f"  Gemini {model}: неверный ответ ({why}; finishReason={fin or '-'}), попытка {attempt}/2")
+            print("    начало ответа:", (raw or r.text)[:500].replace("\n", " "))
+            if attempt == 1:
+                time.sleep(2)
+                continue          # одна повторная попытка на той же модели: ответ случаен
             break
         print("  переключаюсь на следующую модель")
     return None
@@ -267,8 +327,12 @@ def gemini_script(posts, type_key):
     k = len(posts)
     per_item = 3 if k == 1 else 2
     text = "\n\n".join(f"[ПОСТ {n + 1}]\n{p['text'][:1500]}" for n, p in enumerate(posts))
-    return gemini_raw(script_prompt(TYPES.get(type_key, "разное"), k, per_item, text),
-                      lambda d: valid_script(d, k))
+    def check(d):
+        problem = script_problem(normalize_script(d), k)
+        if problem:
+            print("  сценарий не принят:", problem)
+        return problem is None
+    return gemini_raw(script_prompt(TYPES.get(type_key, "разное"), k, per_item, text), check)
 
 
 # ---------- шрифты и текст ----------
@@ -740,6 +804,10 @@ class DailyQuota(Exception):
     pass
 
 
+class NoVoice(Exception):
+    pass
+
+
 def pacific_today():
     try:
         from zoneinfo import ZoneInfo
@@ -796,50 +864,98 @@ def gemini_tts_call(model, text, out_wav):
     return out_wav
 
 
-def find_pauses(wav):
-    """Паузы в аудио: [(начало, конец)] и общая длительность."""
-    total = probe(wav)
-    r = subprocess.run(["ffmpeg", "-hide_banner", "-i", wav, "-af", "silencedetect=noise=-38dB:d=0.22",
-                        "-f", "null", "-"], capture_output=True, text=True)
-    gaps, start = [], None
-    for line in r.stderr.splitlines():
-        m1 = re.search(r"silence_start: ([\d.]+)", line)
-        m2 = re.search(r"silence_end: ([\d.]+)", line)
-        if m1:
-            start = float(m1.group(1))
-        elif m2 and start is not None:
-            gaps.append((start, float(m2.group(1))))
-            start = None
-    return gaps, total
+def energy_envelope(wav, win=0.02):
+    """Громкость по окнам 20 мс (без numpy). Возвращает (список, длительность окна)."""
+    import array
+    r = subprocess.run(["ffmpeg", "-v", "error", "-i", wav, "-f", "s16le", "-ac", "1", "-ar", "16000", "-"],
+                       capture_output=True)
+    samples = array.array("h")
+    samples.frombytes(r.stdout[: len(r.stdout) // 2 * 2])
+    step = int(16000 * win)
+    env = []
+    for i in range(0, len(samples) - step, step):
+        chunk = samples[i:i + step]
+        env.append((sum(x * x for x in chunk) / step) ** 0.5)
+    return env, win
 
 
 def split_by_pauses(wav, texts, work_prefix):
-    """Режет озвучку на len(texts) сцен по самым длинным паузам. Возвращает [(длительность, файл)] или None."""
+    """Режет одну озвучку на len(texts) сцен. Ищет впадины громкости, ближайшие к ожидаемым границам
+    (по длине текстов), поэтому работает, даже если пауз между сценами почти нет. Возвращает [(длительность, файл)]."""
+    import math
     n = len(texts)
-    gaps, total = find_pauses(wav)
-    inner = [g for g in gaps if g[0] > 0.3 and total - g[1] > 0.15]
-    if len(inner) < n - 1:
-        print(f"  в озвучке нашлось {len(inner)} пауз из {n - 1} нужных")
+    env, win = energy_envelope(wav)
+    if len(env) < n * 10:
+        print("  озвучка слишком короткая")
         return None
-    top = sorted(sorted(inner, key=lambda g: g[1] - g[0], reverse=True)[:n - 1])
-    cuts = [0.0] + [(a + b) / 2 for a, b in top] + [total]
+    sm = [sum(env[max(0, i - 2):i + 3]) / len(env[max(0, i - 2):i + 3]) for i in range(len(env))]   # сглаживание ~100 мс
+    top = sorted(sm)[len(sm) // 2:]
+    ref = top[len(top) // 2] or 1.0
+    thr = ref * 0.08
+    first = next((i for i, v in enumerate(sm) if v > thr), 0)
+    last = max((i for i, v in enumerate(sm) if v > thr), default=len(sm) - 1)
+    T = (last - first) * win
     chars = [max(1, len(t)) for t in texts]
-    speech = total - sum(b - a for a, b in top)
-    rate = speech / sum(chars)
+    p = 0.6                                              # ожидаемая пауза между сценами, сек
+    r = max(0.02, (T - (n - 1) * p) / sum(chars))
+    exp = [r * c + (p / 2 if i in (0, n - 1) else p) for i, c in enumerate(chars)]
+    if n == 1:
+        cuts = [first * win, last * win]
+    else:
+        # кандидаты: локальные минимумы громкости внутри речи
+        cand = [i for i in range(first + 8, last - 8)
+                if sm[i] == min(sm[i - 6:i + 7])]
+        if len(cand) < n - 1:
+            cand = list(range(first + 8, last - 8, 3))
+        INF = float("inf")
+        W_VAL = 3.0
+
+        def seg_cost(a_, b_, j):
+            d = (b_ - a_) * win
+            return (math.log(max(d, 0.05) / exp[j])) ** 2
+
+        prev = [(seg_cost(first, c, 0) + W_VAL * sm[c] / ref, -1) for c in cand]
+        back = [prev]
+        for j in range(1, n - 1):
+            cur = []
+            for ci, c in enumerate(cand):
+                best, bi = INF, -1
+                for pi, pc in enumerate(cand):
+                    if pc >= c:
+                        break
+                    v = prev[pi][0] + seg_cost(pc, c, j)
+                    if v < best:
+                        best, bi = v, pi
+                cur.append((best + W_VAL * sm[c] / ref, bi))
+            back.append(cur)
+            prev = cur
+        final, fi = INF, -1
+        for ci, c in enumerate(cand):
+            v = prev[ci][0] + seg_cost(c, last, n - 1)
+            if v < final:
+                final, fi = v, ci
+        if fi < 0 or final == INF:
+            print("  не удалось подобрать границы сцен")
+            return None
+        idx, ci = [], fi
+        for j in range(n - 2, -1, -1):
+            idx.append(cand[ci])
+            ci = back[j][ci][1]
+        idx.reverse()
+        cuts = [first * win] + [i * win for i in idx] + [last * win]
     out = []
     for i in range(n):
         dur = cuts[i + 1] - cuts[i]
-        exp = chars[i] * rate
-        if dur < 0.5 or not (0.4 < dur / max(exp, 0.1) < 3.0):
-            print(f"  сцена {i + 1}: длительность {dur:.1f} с не похожа на ожидаемую {exp:.1f} с, нарезка отклонена")
-            return None
+        ratio = dur / max(exp[i], 0.1)
+        if not (0.5 < ratio < 2.2) or dur < 0.6:
+            print(f"  сцена {i + 1}: {dur:.1f} с при ожидаемых {exp[i]:.1f} с, граница приблизительная")
         seg, fin = f"{work_prefix}seg{i}.wav", f"{work_prefix}voice{i}.wav"
         run(["ffmpeg", "-y", "-i", wav, "-ss", f"{cuts[i]:.3f}", "-to", f"{cuts[i + 1]:.3f}",
-             "-ar", "24000", "-ac", "1", seg])
+             "-af", "afade=t=in:d=0.02", "-ar", "24000", "-ac", "1", seg])
         trim_silence(seg, fin)
         d = probe(fin)
-        if d < 0.3:
-            return None
+        if d < 0.2:                       # trim съел всё: берём сегмент как есть
+            fin, d = seg, probe(seg)
         out.append((d, fin))
     return out
 
@@ -857,7 +973,7 @@ async def gemini_tts_batch(texts):
             continue
         if tried >= 2:                       # не жжём лимиты: максимум две модели на ролик
             break
-        sep = " <long pause> " if model.startswith("gemini-3.8") else "\n\n"
+        sep = " <long pause> <long pause> " if model.startswith("gemini-3.8") else "\n\n"
         text = sep.join(prepared)
         tried += 1
         try:
@@ -1291,6 +1407,8 @@ async def build_short(items, hook, out):
         elif voice_ok:
             s["voice_d"], s["voice"] = await tts(s["text"], f"{WORK}/voice{si}.wav")
             if not s["voice_d"]:
+                if REQUIRE_VOICE:
+                    raise NoVoice("ни Gemini, ни запасной голос не сработали")
                 print("  озвучка недоступна, делаю ролик без голоса")
                 voice_ok = False
                 for p in plan:
@@ -1426,12 +1544,15 @@ async def main():
                         attributes=[DocumentAttributeVideo(duration=int(total), w=W, h=H,
                                                            supports_streaming=True)],
                     )
-                    for p in got:
+                    for p in got[:len(items)]:       # списываем только те посты, что вошли в ролик
                         used.add(p["id"])
                         fails.pop(str(p["id"]), None)
                     last_type = gtype
                     done += 1
                     print(tag, "ролик отправлен в", SHORTS_CHAT)
+                except NoVoice as e:          # не вина постов: не засчитываем ошибку, попробуем в следующий запуск
+                    print(tag, f"голос недоступен ({e}), ролик не публикую, повторю позже")
+                    break
                 except Exception as e:
                     for p in group:
                         kk = str(p["id"])
