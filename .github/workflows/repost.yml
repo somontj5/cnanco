@@ -1,32 +1,38 @@
 name: repost
 on:
   schedule:
-    - cron: "7,37 * * * *"
+    - cron: "7,37 * * * *"   # запасной запуск; основной делает cron-job.org
   workflow_dispatch:
 permissions:
   contents: write
 concurrency:
-  group: telegram-session
+  group: telegram-session   # общая очередь: все боты с одним аккаунтом Telegram идут по одному
   cancel-in-progress: false
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: pip install telethon requests hachoir 
+      - run: pip install -U telethon requests hachoir
       - run: python repost.py
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           TG_SESSION: ${{ secrets.TG_SESSION }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Старые секреты нужны только один раз: при первом запуске каналы переносятся
+          # в config.json, и дальше ими управляет бот. После этого их можно удалить.
           SOURCE_CHANNELS: ${{ secrets.SOURCE_CHANNELS }}
           TARGET_CHANNEL: ${{ secrets.TARGET_CHANNEL }}
           FOOTER: ${{ secrets.FOOTER }}
-          EXTRA_EXT: ${{ secrets.EXTRA_EXT }}
+          SOURCE_CHANNELS_2: ${{ secrets.SOURCE_CHANNELS_2 }}
+          TARGET_CHANNEL_2: ${{ secrets.TARGET_CHANNEL_2 }}
+          FOOTER_2: ${{ secrets.FOOTER_2 }}
+          CHANNEL_TOPIC_2: ${{ secrets.CHANNEL_TOPIC_2 }}
       - name: save state
+        if: always()
         run: |
           git config user.name "bot"
           git config user.email "bot@users.noreply.github.com"
-          git add state.json
-          git diff --staged --quiet || (git commit -m "state" && git pull --rebase && git push)
+          for f in state*.json config.json; do [ -f "$f" ] && git add "$f"; done
+          git diff --staged --quiet || (git commit -m "repost state" && (git pull --rebase && git push || (sleep 7 && git pull --rebase && git push)))
