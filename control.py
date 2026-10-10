@@ -118,7 +118,8 @@ def v_main(cfg):
     return (f"🤖 Управление репостами\nКаналов: {n} (включено: {on})\n\n"
             "Все настройки меняются здесь, в секреты GitHub заходить не нужно.",
             [[("📺 Мои каналы", "l"), ("➕ Новый канал", "pn")],
-             [("🎬 Shorts", "sh"), ("ℹ️ Статус", "st")],
+             [("🎬 Shorts", "sh"), ("✂️ Нарезки", "cl")],
+             [("ℹ️ Статус", "st")],
              [("▶️ Запустить репост", "run"), ("▶️ Запустить Shorts", "runs")]])
 
 
@@ -190,6 +191,38 @@ def v_shorts(cfg):
         [("📥 Откуда брать посты", "she:channel"), ("🔖 Название в призыве", "she:handle")],
         [(f"🔒 Доступ: {PRIVACY_RU.get(s.get('privacy', 'public'))}", "shp"), (f"🗣 Голос: {s.get('voice') or 'Puck'}", "shv")],
         [("💬 Куда слать копию", "she:chat"), ("⬅️ Меню", "m")]]
+
+
+def resolve_yt_channel(t):
+    """Ссылка, @имя или ID канала YouTube -> (ID вида UC..., название) или (None, None)."""
+    t = (t or "").strip()
+    m = re.search(r"(UC[\w-]{22})", t)
+    if m:
+        return m.group(1), None
+    url = t if t.startswith("http") else "https://www.youtube.com/" + (t if t.startswith("@") else "@" + t)
+    try:
+        html = requests.get(url, headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "en"},
+                            cookies={"CONSENT": "YES+1"}, timeout=20).text
+    except Exception:
+        return None, None
+    m = re.search(r'"(?:externalId|channelId)":"(UC[\w-]{22})"', html) or re.search(r"channel_id=(UC[\w-]{22})", html)
+    name = re.search(r"<title>(.*?)(?: - YouTube)?</title>", html)
+    return (m.group(1) if m else None), (name.group(1).strip() if name else None)
+
+
+def v_clips(cfg):
+    c = cfg.setdefault("clips", {})
+    text = ("✂️ Нарезки из чужого YouTube-канала (с разрешения автора)\n"
+            f"Канал: {c.get('author') or 'ECKOSOLDIER'} ({c.get('channel_id') or 'UCkjxZqW8zRi4rexA3TMvmrA'})\n"
+            f"Подпись автора на ролике: {c.get('credit') or '@ecko'}\n"
+            f"Нарезок из одного видео: {c.get('per_video') or 2}\n"
+            f"Русские субтитры: {'да' if c.get('subs', True) else 'нет'}\n"
+            f"Статус: {'включено' if c.get('enabled', True) else 'выключено'}")
+    return text, [
+        [("📺 Канал YouTube", "cle:channel"), ("🏷 Подпись автора", "cle:credit")],
+        [(f"🔢 Нарезок: {c.get('per_video') or 2}", "clp"), (f"💬 Субтитры: {'да' if c.get('subs', True) else 'нет'}", "clv")],
+        [("⏯ Вкл/выкл", "cln"), ("▶️ Запустить сейчас", "clr")],
+        [("⬅️ Меню", "m")]]
 
 
 def v_status(cfg):
@@ -269,6 +302,25 @@ def apply_input(ctx, chat, text):
         send(chat, f"Создал канал «{title}». Теперь добавим первый источник.")
         ask(ctx, chat, None, {"kind": "add_source", "pid": npid},
             "Пришли канал-источник: @имя или ссылку. Можно сразу с подписью через «|», например:\n@канал | Художник пишет")
+        return
+    if kind == "clips":
+        c = cfg.setdefault("clips", {})
+        if aw["field"] == "channel":
+            cid, name = resolve_yt_channel(t)
+            if not cid:
+                send(chat, "Не нашёл канал. Пришли ссылку на канал, @имя или ID, который начинается на UC.")
+                cs["await"][str(chat)] = aw
+                return
+            c["channel_id"] = cid
+            if name:
+                c["author"] = name
+            hm = re.search(r"@[\w.-]+", t)
+            if hm:
+                c["credit"] = hm.group(0)
+        else:
+            c["credit"] = t
+        send(chat, "Сохранил ✅")
+        show(ctx, chat, None, v_clips(cfg))
         return
     if prof is None and kind not in ("shorts",):
         send(chat, "Этот канал уже удалён.", v_main(cfg)[1])
@@ -372,6 +424,31 @@ def on_callback(ctx, chat, mid, data):
                     [[("⬅️ Меню", "m")]])
     if c == "sh":
         return show(ctx, chat, mid, v_shorts(cfg))
+    if c == "cl":
+        return show(ctx, chat, mid, v_clips(cfg))
+    if c == "cle":
+        q = {"channel": "Пришли канал YouTube, из которого нарезать: ссылку, @имя или ID (начинается на UC).",
+             "credit": "Как подписать автора на ролике, например @ecko."}[parts[1]]
+        return ask(ctx, chat, mid, {"kind": "clips", "field": parts[1]}, q)
+    if c == "clp":
+        cc = cfg.setdefault("clips", {})
+        cc["per_video"] = (cc.get("per_video") or 2) % 3 + 1
+        ctx.changed = True
+        return show(ctx, chat, mid, v_clips(cfg))
+    if c == "clv":
+        cc = cfg.setdefault("clips", {})
+        cc["subs"] = not cc.get("subs", True)
+        ctx.changed = True
+        return show(ctx, chat, mid, v_clips(cfg))
+    if c == "cln":
+        cc = cfg.setdefault("clips", {})
+        cc["enabled"] = not cc.get("enabled", True)
+        ctx.changed = True
+        return show(ctx, chat, mid, v_clips(cfg))
+    if c == "clr":
+        ok, info = dispatch("clips.yml")
+        return edit(chat, mid, ("▶️ Запустил нарезки. Результат смотри в логах GitHub Actions." if ok else f"Не получилось запустить: {info}"),
+                    [[("⬅️ Нарезки", "cl")]])
     if c == "shp":
         s = cfg.setdefault("shorts", {})
         s["privacy"] = PRIVACY[(PRIVACY.index(s.get("privacy", "public")) + 1) % len(PRIVACY)]
