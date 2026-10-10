@@ -3,9 +3,10 @@
 Что лежит в секретах GitHub: только токены (BOT_TOKEN, API_ID, API_HASH, TG_SESSION, GEMINI_API_KEY и т.д.).
 Все остальные настройки (каналы, подписи, режимы) хранятся в config.json и меняются кнопками этого бота.
 """
-import os, re, json, hashlib, requests
+import os, re, json, time, hashlib, requests
 
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+LIVE = int(os.environ.get("LIVE_SECONDS") or 0)   # сколько секунд бот «живёт» за один запуск (0 = один опрос и выход)
 CONFIG_FILE = "config.json"
 CS_FILE = "control_state.json"
 API = f"https://api.telegram.org/bot{TOKEN}/"
@@ -475,34 +476,46 @@ def main():
     cs.setdefault("await", {})
     ctx = Ctx(cfg, cs)
     admin_env = int(os.environ.get("ADMIN_ID") or 0)
-    r = api("getUpdates", timeout=0, limit=100, allowed_updates=["message", "callback_query"])
-    updates = r.get("result") or []
-    print(f"Новых обращений к боту: {len(updates)}")
-    last = 0
-    for u in updates:
-        last = u["update_id"]
-        try:
-            if "callback_query" in u:
-                q = u["callback_query"]
-                api("answerCallbackQuery", callback_query_id=q["id"])
-                uid = q["from"]["id"]
-                if uid != (admin_env or cs.get("admin", 0)):
-                    continue
-                m = q.get("message") or {}
-                on_callback(ctx, m["chat"]["id"], m.get("message_id"), q.get("data", ""))
-            elif "message" in u:
-                m = u["message"]
-                if m.get("chat", {}).get("type") != "private":
-                    continue
-                on_message(ctx, m["chat"]["id"], m["from"]["id"], m.get("text", ""), admin_env)
-        except Exception as e:
-            print("  ошибка обработки:", e)
-    if ctx.changed:
-        save(CONFIG_FILE, cfg)
-        save(CS_FILE, cs)
-        print("Настройки сохранены")
-    if last:
-        api("getUpdates", offset=last + 1, limit=1, timeout=0)   # подтверждаем обработку
+    deadline = time.time() + LIVE
+    offset, handled, polls = None, 0, 0
+    while True:
+        remaining = deadline - time.time()
+        poll = 0 if LIVE <= 0 else max(0, min(25, int(remaining)))     # долгий опрос: ответ приходит сразу, как только ты нажал
+        params = dict(timeout=poll, limit=100, allowed_updates=["message", "callback_query"])
+        if offset:
+            params["offset"] = offset                               # это же подтверждает прошлые обращения
+        updates = api("getUpdates", **params).get("result") or []
+        polls += 1
+        for u in updates:
+            offset = u["update_id"] + 1
+            handled += 1
+            try:
+                if "callback_query" in u:
+                    q = u["callback_query"]
+                    api("answerCallbackQuery", callback_query_id=q["id"])
+                    if q["from"]["id"] != (admin_env or cs.get("admin", 0)):
+                        continue
+                    m = q.get("message") or {}
+                    on_callback(ctx, m["chat"]["id"], m.get("message_id"), q.get("data", ""))
+                elif "message" in u:
+                    m = u["message"]
+                    if m.get("chat", {}).get("type") != "private":
+                        continue
+                    on_message(ctx, m["chat"]["id"], m["from"]["id"], m.get("text", ""), admin_env)
+            except Exception as e:
+                print("  ошибка обработки:", e)
+        if ctx.changed:
+            save(CONFIG_FILE, cfg)
+            save(CS_FILE, cs)
+            ctx.changed = False
+            print("Настройки сохранены")
+        if LIVE <= 0 or time.time() >= deadline - 0.5:
+            break
+        if poll == 0:
+            time.sleep(0.3)
+    if offset:
+        api("getUpdates", offset=offset, limit=1, timeout=0)         # окончательно подтверждаем обработку
+    print(f"Обработано обращений: {handled}, опросов: {polls}, работал {LIVE if LIVE else 0} с")
 
 
 if __name__ == "__main__":
