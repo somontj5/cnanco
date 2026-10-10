@@ -99,7 +99,7 @@
    "per_run": 10,
    "first_run_hours": 999,
    "state_file": "state_chlololoshkafa.json",
-   "enabled": true,
+   "enabled": false,
    "sources": [
     {
      "id": "@montazh1230",
