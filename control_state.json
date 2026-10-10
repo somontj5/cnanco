@@ -1,9 +1,7 @@
 {
  "await": {
   "8755398440": {
-   "kind": "edit",
-   "pid": "main",
-   "field": "footer"
+   "kind": "new_profile"
   }
  },
  "admin": 8755398440
