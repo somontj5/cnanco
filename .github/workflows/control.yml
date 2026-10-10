@@ -1,7 +1,7 @@
 name: control
 on:
   schedule:
-    - cron: "*/10 * * * *"   # запасной; чтобы бот отвечал быстро, запускай его через cron-job.org
+    - cron: "*/15 * * * *"   # запасной; основной запуск: cron-job.org каждую минуту
   workflow_dispatch:
 permissions:
   contents: write
@@ -12,6 +12,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     steps:
       - uses: actions/checkout@v4
       - run: pip install requests
@@ -20,6 +21,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
           GH_TOKEN: ${{ github.token }}
+          LIVE_SECONDS: "38"   # бот живёт 38 с + около 11 с на запуск = примерно 50 с на весь запуск
       - name: save settings
         if: always()
         run: |
