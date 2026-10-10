@@ -94,7 +94,7 @@
    "target": "@lololoshkafandom",
    "footer": "",
    "topic": "",
-   "mode": "new",
+   "mode": "sequential",
    "rewrite": "ai",
    "per_run": 10,
    "first_run_hours": 999,
