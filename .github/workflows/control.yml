@@ -1,0 +1,29 @@
+name: control
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # запасной; чтобы бот отвечал быстро, запускай его через cron-job.org
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: control
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install requests
+      - run: python control.py
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          GH_TOKEN: ${{ github.token }}
+      - name: save settings
+        if: always()
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          for f in config.json control_state.json; do [ -f "$f" ] && git add "$f"; done
+          git diff --staged --quiet || (git commit -m "control settings" && (git pull --rebase && git push || (sleep 7 && git pull --rebase && git push)))
