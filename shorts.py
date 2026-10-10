@@ -7,10 +7,18 @@ from telethon.tl.types import DocumentAttributeVideo
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 SESSION = os.environ["TG_SESSION"]
-TARGET = os.environ["TARGET_CHANNEL"]
+try:   # настройки, которые меняются через бота управления (config.json), главнее секретов GitHub
+    _SC = json.load(open("config.json", encoding="utf-8")).get("shorts") or {}
+except Exception:
+    _SC = {}
+TARGET = _SC.get("channel") or os.environ.get("TARGET_CHANNEL", "").strip()
+if not TARGET:
+    raise SystemExit("Не задан канал, из которого брать посты: укажи его в боте (Shorts -> Откуда брать посты) или в секрете TARGET_CHANNEL")
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
-HANDLE = os.environ.get("CHANNEL_HANDLE", "").strip() or (TARGET if TARGET.startswith("@") else "")
-SHORTS_CHAT = os.environ.get("SHORTS_CHAT", "").strip() or "me"   # "me" = «Избранное»
+HANDLE = _SC.get("handle") or os.environ.get("CHANNEL_HANDLE", "").strip() or (TARGET if TARGET.startswith("@") else "")
+SHORTS_CHAT = _SC.get("chat") or os.environ.get("SHORTS_CHAT", "").strip() or "me"
+if re.fullmatch(r"-?\d+", str(SHORTS_CHAT)):
+    SHORTS_CHAT = int(SHORTS_CHAT)   # "me" = «Избранное»
 MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 SCAN = 300          # сколько последних сообщений своего канала просматривать
 PER_RUN = 1         # сколько роликов делать за запуск
@@ -31,7 +39,7 @@ MUSIC_VOL_VOICE = 0.12                            # громкость музы�
 POLL_KEY = os.environ.get("POLLINATIONS_KEY", "").strip()   # бесплатный ключ с enter.pollinations.ai (без него ограничения)
 GEN_MAX = 4                                       # сколько картинок генерировать на один ролик (только если реальных фото мало)
 TTS_ENGINE = os.environ.get("TTS_ENGINE", "").strip().lower() or "gemini"   # gemini = голос Gemini TTS, edge = голос Microsoft
-GEMINI_VOICE = os.environ.get("GEMINI_VOICE", "").strip() or "Puck"          # Puck (бодрый), Fenrir (азартный), Charon (диктор), Kore (твёрдый), Leda (молодой)
+GEMINI_VOICE = _SC.get("voice") or os.environ.get("GEMINI_VOICE", "").strip() or "Puck"          # Puck (бодрый), Fenrir (азартный), Charon (диктор), Kore (твёрдый), Leda (молодой)
 GEMINI_TTS_STYLE = os.environ.get("GEMINI_TTS_STYLE", "").strip() or "upbeat, energetic, friendly storyteller"
 # Порядок моделей озвучки. У каждой бесплатно 10 запросов в сутки, на один ролик уходит 1 запрос.
 GEMINI_TTS_MODELS = ["gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts", "gemini-3.1-flash-tts-preview",
@@ -698,7 +706,7 @@ async def find_candidates(client, target, used):
 YT_ID = os.environ.get("YT_CLIENT_ID", "").strip()
 YT_SECRET = os.environ.get("YT_CLIENT_SECRET", "").strip()
 YT_REFRESH = os.environ.get("YT_REFRESH_TOKEN", "").strip()
-YT_PRIVACY = os.environ.get("YT_PRIVACY", "").strip() or "public"   # public / unlisted / private
+YT_PRIVACY = _SC.get("privacy") or os.environ.get("YT_PRIVACY", "").strip() or "public"   # public / unlisted / private
 
 
 def youtube_upload(path, title, description):
@@ -1472,7 +1480,7 @@ async def main():
     done = 0
     try:
         async with TelegramClient(StringSession(SESSION), API_ID, API_HASH) as client:
-            target = await client.get_entity(TARGET)
+            target = await client.get_entity(int(TARGET) if re.fullmatch(r"-?\d+", str(TARGET)) else TARGET)
             for _ in range(PER_RUN):
                 cands = [p for p in await find_candidates(client, target, used)]
                 print("Кандидатов:", len(cands))
