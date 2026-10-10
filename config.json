@@ -1,0 +1,93 @@
+{
+ "profiles": {
+  "main": {
+   "title": "Канал 1",
+   "target": "@MOD_MAINCRAFT_VSE",
+   "footer": "",
+   "topic": "",
+   "mode": "new",
+   "rewrite": "ai",
+   "per_run": 10,
+   "first_run_hours": 999,
+   "state_file": "state.json",
+   "enabled": true,
+   "sources": [
+    {
+     "id": "@mods_for_minecraft_pe",
+     "sig": "",
+     "only_video": false
+    },
+    {
+     "id": "@StarModsMc",
+     "sig": "",
+     "only_video": false
+    },
+    {
+     "id": "@sigmamods",
+     "sig": "",
+     "only_video": false
+    },
+    {
+     "id": "@bedrockcheatsminecraft",
+     "sig": "",
+     "only_video": false
+    },
+    {
+     "id": "@morimodd",
+     "sig": "",
+     "only_video": false
+    },
+    {
+     "id": "@skachatvfga",
+     "sig": "",
+     "only_video": false
+    },
+    {
+     "id": "@JDHMods",
+     "sig": "",
+     "only_video": false
+    },
+    {
+     "id": "@minecraft_ideas_mods",
+     "sig": "",
+     "only_video": false
+    },
+    {
+     "id": "@duna_minecraft",
+     "sig": "",
+     "only_video": false
+    },
+    {
+     "id": "@itsTemari",
+     "sig": "",
+     "only_video": false
+    },
+    {
+     "id": "@Horrormobilemods",
+     "sig": "",
+     "only_video": false
+    },
+    {
+     "id": "@Craftorial",
+     "sig": "",
+     "only_video": false
+    },
+    {
+     "id": "@horrormodsbedrock",
+     "sig": "",
+     "only_video": false
+    },
+    {
+     "id": "@vigmanas",
+     "sig": "",
+     "only_video": false
+    },
+    {
+     "id": "@mcnewru",
+     "sig": "",
+     "only_video": false
+    }
+   ]
+  }
+ }
+}
