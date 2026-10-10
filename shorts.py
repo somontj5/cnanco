@@ -12,8 +12,6 @@ try:   # настройки, которые меняются через бота
 except Exception:
     _SC = {}
 TARGET = _SC.get("channel") or os.environ.get("TARGET_CHANNEL", "").strip()
-if not TARGET:
-    raise SystemExit("Не задан канал, из которого брать посты: укажи его в боте (Shorts -> Откуда брать посты) или в секрете TARGET_CHANNEL")
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 HANDLE = _SC.get("handle") or os.environ.get("CHANNEL_HANDLE", "").strip() or (TARGET if TARGET.startswith("@") else "")
 SHORTS_CHAT = _SC.get("chat") or os.environ.get("SHORTS_CHAT", "").strip() or "me"
@@ -1470,6 +1468,8 @@ async def build_short(items, hook, out):
 
 async def main():
     os.makedirs(WORK, exist_ok=True)
+    if not TARGET:
+        raise SystemExit("Не задан канал, из которого брать посты: укажи его в боте (Shorts -> Откуда брать посты) или в секрете TARGET_CHANNEL")
     ensure_fonts()
     state = json.load(open(STATE)) if os.path.exists(STATE) else {}
     used = set(state.get("used", []))
