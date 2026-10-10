@@ -100,7 +100,20 @@
    "first_run_hours": 999,
    "state_file": "state_chlololoshkafa.json",
    "enabled": true,
-   "sources": []
+   "sources": [
+    {
+     "id": "@montazh1230",
+     "sig": "монтажер пишет",
+     "only_video": false,
+     "from_id": 0
+    },
+    {
+     "id": "@videolo9090",
+     "sig": "",
+     "only_video": true,
+     "from_id": 0
+    }
+   ]
   }
  }
 }
