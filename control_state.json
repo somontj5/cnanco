@@ -1,7 +1,8 @@
 {
  "await": {
   "8755398440": {
-   "kind": "new_profile"
+   "kind": "add_source",
+   "pid": "chlololoshkafa"
   }
  },
  "admin": 8755398440

@@ -88,6 +88,19 @@
      "only_video": false
     }
    ]
+  },
+  "chlololoshkafa": {
+   "title": "Лололошка фандом",
+   "target": "@lololoshkafandom",
+   "footer": "",
+   "topic": "",
+   "mode": "new",
+   "rewrite": "ai",
+   "per_run": 10,
+   "first_run_hours": 999,
+   "state_file": "state_chlololoshkafa.json",
+   "enabled": true,
+   "sources": []
   }
  }
 }
