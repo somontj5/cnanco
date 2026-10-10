@@ -8,21 +8,16 @@ from telethon.sessions import StringSession
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 SESSION = os.environ["TG_SESSION"]
-SOURCES = [s.strip() for s in os.environ["SOURCE_CHANNELS"].split(",") if s.strip()]
-TARGET = os.environ["TARGET_CHANNEL"]
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
-FOOTER = os.environ.get("FOOTER", "").strip()
 MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 MAX_PER_RUN = 10          # сколько постов опубликовать за один запуск
 MAX_AI_PER_RUN = 60       # сколько постов показать Gemini за один запуск (защита от слишком долгого запуска)
-FIRST_RUN_HOURS = 999     # история при первом запуске для нового канала (потом верни 24)
 SETTLE_MIN = 5            # свежие посты младше N минут ждут следующего запуска
 TARGET_SCAN = 1500        # сколько последних сообщений своего канала сканировать для защиты от дублей
 GEMINI_TRIES = 2          # попыток на каждую модель при ошибках 5xx
 MAX_FAILS = 3             # после стольких неудач Gemini пост пропускается навсегда
-STATE = "state.json"
 
-PROMPT = (
+PROMPT_MC = (
     "Ты главный редактор Telegram-канала про Minecraft Bedrock: моды, аддоны, DLC, "
     "текстурпаки, шейдеры, читы, клиенты, а также идеи и фото построек, скриншоты и видео. "
     "Тебе приходит пост из чужого канала: текст (может отсутствовать), количество фото и видео "
@@ -58,6 +53,128 @@ PROMPT = (
     "если оно там латиницей), а если названия нет, поставь прочерк\n"
     "готовое описание (со следующей строки)\n\n"
 )
+
+PROMPT_GENERIC = (
+    "Ты главный редактор Telegram-канала на тему: {topic}. "
+    "Тебе приходит пост из чужого канала: текст (может отсутствовать), количество фото и видео "
+    "и список файлов. Сначала реши, публиковать ли его у нас.\n\n"
+    "ПУБЛИКОВАТЬ любой нормальный контент по теме канала. Пост без текста, где есть только файл "
+    "или только фото, тоже можно публиковать: составь короткое описание по названию файла или по "
+    "тому, что видно из контекста, ничего не выдумывая.\n"
+    "ПРОПУСТИТЬ только если пост:\n"
+    "- реклама или продажа рекламы, услуг, ставок, казино, заработка, ботов, серверов, чужих каналов;\n"
+    "- розыгрыш, опрос или объявление канала, не связанное с контентом;\n"
+    "- не по теме канала;\n"
+    "- пустой или бессмысленный.\n"
+    "Если в хорошем посте есть рекламная строка или ссылка на чужой канал, всё равно публикуй, "
+    "а эти части убери.\n\n"
+    "Если публикуешь, напиши описание своими словами:\n"
+    "1) Названия, версии и цифры сохрани точно.\n"
+    "2) Суть переформулируй: тот же смысл, но другие слова и структура.\n"
+    "3) Убери ссылки, @упоминания, названия чужих каналов, рекламу, призывы подписаться, "
+    "слова про комментарии, навигацию и переходники, а также кнопки и призывы вроде «Скачать» "
+    "и указатели 👉👈: файлы мы прикладываем сами.\n"
+    "4) Не больше 600 символов, 1-2 уместных эмодзи.\n"
+    "5) В конце один короткий хэштег по типу контента.\n\n"
+    "Формат ответа строго такой, без пояснений и без markdown.\n"
+    "Если пропускаешь:\n"
+    "РЕШЕНИЕ: ПРОПУСТИТЬ — короткая причина\n"
+    "Если публикуешь:\n"
+    "РЕШЕНИЕ: ПУБЛИКОВАТЬ\n"
+    "НАЗВАНИЕ: оригинальное название (как в источнике), а если названия нет, поставь прочерк\n"
+    "готовое описание (со следующей строки)\n\n"
+)
+
+
+def prompt_for(topic):
+    """Minecraft Bedrock по умолчанию; если у канала задана тема, подставляется она."""
+    return PROMPT_GENERIC.replace("{topic}", topic) if topic else PROMPT_MC
+
+
+# ---------- профили каналов (config.json, управляется через бота) ----------
+
+CONFIG_FILE = "config.json"
+SEQ_BATCH = 100        # в режиме «по порядку» за раз просматривается столько сообщений источника
+
+
+def ref(x):
+    """Числовой id канала (-100...) превращаем в число, имена и @ссылки оставляем как есть."""
+    return int(x) if re.fullmatch(r"-?\d+", str(x)) else x
+
+
+def new_profile(**kw):
+    p = dict(title="", target="", footer="", topic="", mode="new", rewrite="ai", per_run=10,
+             first_run_hours=999, state_file="", enabled=True, sources=[])
+    p.update(kw)
+    return p
+
+
+def load_config():
+    try:
+        return json.load(open(CONFIG_FILE, encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    json.dump(cfg, open(CONFIG_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+
+
+def _src_list(env):
+    return [dict(id=x.strip(), sig="", only_video=False) for x in os.environ.get(env, "").split(",") if x.strip()]
+
+
+def bootstrap(cfg):
+    """Первый запуск без config.json: переносим каналы из старых секретов GitHub, дальше всё через бота."""
+    if cfg.get("profiles"):
+        return False
+    profs = {}
+    src, tgt = _src_list("SOURCE_CHANNELS"), os.environ.get("TARGET_CHANNEL", "").strip()
+    if src and tgt:
+        profs["main"] = new_profile(title="Канал 1", target=tgt, footer=os.environ.get("FOOTER", "").strip(),
+                                    topic=os.environ.get("CHANNEL_TOPIC", "").strip(), sources=src,
+                                    state_file=os.environ.get("STATE_FILE", "").strip() or "state.json",
+                                    first_run_hours=int(os.environ.get("FIRST_RUN_HOURS") or 999))
+    src2, tgt2 = _src_list("SOURCE_CHANNELS_2"), os.environ.get("TARGET_CHANNEL_2", "").strip()
+    if src2 and tgt2:
+        profs["second"] = new_profile(title="Канал 2", target=tgt2, footer=os.environ.get("FOOTER_2", "").strip(),
+                                      topic=os.environ.get("CHANNEL_TOPIC_2", "").strip(), sources=src2,
+                                      state_file="state2.json", first_run_hours=48)
+    if not profs:
+        return False
+    cfg["profiles"] = profs
+    return True
+
+
+def norm_sources(prof):
+    out = []
+    for x in prof.get("sources", []):
+        if isinstance(x, str):
+            x = dict(id=x)
+        if x.get("id"):
+            out.append(dict(id=x["id"], sig=x.get("sig", ""), only_video=bool(x.get("only_video")),
+                            from_id=int(x.get("from_id") or 0)))
+    return out
+
+
+def is_video(m):
+    d = getattr(m, "document", None)
+    return bool(getattr(m, "video", None) or getattr(m, "gif", None) or
+                (d is not None and (getattr(d, "mime_type", "") or "").startswith("video")))
+
+
+def clean_original(text):
+    t = re.sub(r"https?://\S+|t\.me/\S+|@\w+", "", text or "")
+    t = re.sub(r"[ \t]+", " ", t)
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
+
+
+def compose(sig, body, footer):
+    """Подпись канала-источника в начале, затем текст, затем подпись твоего канала. Всего не больше 1024 знаков."""
+    fixed = [x for x in (sig, footer) if x]
+    room = max(0, 1024 - sum(len(x) + 2 for x in fixed))
+    return "\n\n".join(x for x in (sig, (body or "")[:room], footer) if x)[:1024]
+
 
 dead = set()
 counter = 0
@@ -154,21 +271,23 @@ def parse_answer(out):
     return None, "", None, ""
 
 
-def build_input(p):
+def build_input(p, prompt):
     photos = sum(1 for m in p["msgs"] if m.photo)
     videos = sum(1 for m in p["msgs"] if m.video or m.gif)
     docs = [m for m in p["msgs"] if is_doc_file(m)]
     names = "\n".join(f"- {fname(f)} ({(f.file.size or 0) // 1024} КБ)" for f in docs) or "нет"
     fwd = "да" if p["fwd"] else "нет"
-    return (PROMPT + f"Пост переслан из другого канала: {fwd}\n"
+    return (prompt + f"Пост переслан из другого канала: {fwd}\n"
             f"Содержимое: фото {photos}, видео {videos}, файлов {len(docs)}\n"
             f"Файлы:\n{names}\n\n"
             f"Текст поста:\n{p['text'] or '(текста нет)'}")
 
 
-def make_caption(p):
+def make_caption(p, prompt, footer="", sig="", mode="ai"):
     """Возвращает (статус, название, описание, причина). Статусы: ok, skip, quota, fail."""
-    status, out = rewrite(build_input(p))
+    if mode == "keep":       # без ИИ: текст источника как есть (без ссылок), подпись и футер добавляются
+        return "ok", None, compose(sig, clean_original(p["text"]), footer), ""
+    status, out = rewrite(build_input(p, prompt))
     if status != "ok":
         return status, None, None, ""
     decision, reason, title, body = parse_answer(out)
@@ -177,9 +296,7 @@ def make_caption(p):
     if decision != "publish" or not body:
         print("  ответ без понятного решения:", out[:150].replace("\n", " "))
         return "fail", None, None, ""
-    if FOOTER:
-        body = body[:900] + "\n\n" + FOOTER
-    return "ok", title, body[:1024], ""
+    return "ok", title, compose(sig, body, footer), ""
 
 
 # ---------- ключи для защиты от дублей ----------
@@ -278,7 +395,7 @@ def build_posts(msgs):
     return posts
 
 
-VERSION = "v5: запрет пересылки больше не блокирует"
+VERSION = "v6: профили каналов, подписи, режим «по порядку», управление через бота"
 
 
 def can_copy(ent):
@@ -473,7 +590,16 @@ def hold(pending, src, p):
         pending[src] = p["first"]
 
 
-async def main():
+async def run_profile(client, name, prof):
+    STATE = prof["state_file"] or (f"state_{name}.json")
+    SOURCES = norm_sources(prof)
+    PROMPT = prompt_for(prof.get("topic", ""))
+    FOOTER = prof.get("footer", "")
+    MAX_PER_RUN = int(prof.get("per_run") or 10)
+    FIRST_RUN_HOURS = int(prof.get("first_run_hours") or 999)
+    mode = prof.get("mode", "new")
+    rewrite_mode = prof.get("rewrite", "ai")
+    sig_by = {sc["id"]: sc["sig"] for sc in SOURCES}
     state = json.load(open(STATE)) if os.path.exists(STATE) else {}
     seen = list(state.get("_seen", []))
     seen_set = set(seen)
@@ -490,12 +616,11 @@ async def main():
                 seen.append(k)
                 seen_set.add(k)
 
-    print("Версия repost.py:", VERSION)
     print("Источники:", len(SOURCES), "| state:",
           {k: v for k, v in state.items() if not k.startswith("_")})
     try:
-        async with TelegramClient(StringSession(SESSION), API_ID, API_HASH) as client:
-            target = await client.get_entity(TARGET)
+        if True:
+            target = await client.get_entity(ref(prof["target"]))
 
             # 1) что уже лежит в твоём канале: по этому тоже ищем дубли
             n0 = len(seen_set)
@@ -508,9 +633,10 @@ async def main():
             collected = []
             max_ids = {}
             protected_src = {}
-            for src in SOURCES:
+            for sc in SOURCES:
+                src = sc["id"]
                 try:
-                    entity = await client.get_entity(src)
+                    entity = await client.get_entity(ref(src))
                 except Exception as e:
                     print(f"[{src}] не удалось открыть канал: {e}")
                     continue
@@ -521,7 +647,11 @@ async def main():
                 if protected_src[src]:
                     print(f"[{src}] запрет пересылки: скачиваю файлы и загружаю заново")
                 last = state.get(src, 0)
-                if last:
+                if mode == "sequential":   # «сериал»: идём от самого первого поста вниз, понемногу за запуск
+                    if not last and sc.get("from_id"):
+                        last = max(0, sc["from_id"] - 1)
+                    it = client.iter_messages(entity, min_id=last, reverse=True, limit=SEQ_BATCH)
+                elif last:
                     it = client.iter_messages(entity, min_id=last, reverse=True)
                 else:  # новый канал: история за FIRST_RUN_HOURS часов
                     it = client.iter_messages(entity, offset_date=cutoff, reverse=True)
@@ -534,7 +664,14 @@ async def main():
                 print(f"[{src}] last={last}, сообщений={len(msgs)}, фото={photos}, файлы по расширениям={exts}")
                 max_ids[src] = max(m.id for m in msgs)
                 posts = build_posts(msgs)
+                if mode == "sequential" and len(msgs) >= SEQ_BATCH and len(posts) > 1:
+                    tail = posts.pop()                  # последний пост мог оборваться на границе пачки
+                    max_ids[src] = tail["first"] - 1
                 print(f"  постов собрано: {len(posts)}")
+                if sc.get("only_video"):
+                    before = len(posts)
+                    posts = [p for p in posts if any(is_video(m) for m in p["msgs"])]
+                    print(f"  только видео: осталось {len(posts)} из {before}")
                 for p in posts:
                     collected.append((src, p))
 
@@ -596,9 +733,10 @@ async def main():
                     print(tag, "дубль, пропускаю")
                     continue
 
-                ai_calls += 1
-                print(tag, "запрос к Gemini")
-                status, title, caption, reason = make_caption(p)
+                if rewrite_mode != "keep":
+                    ai_calls += 1
+                    print(tag, "запрос к Gemini")
+                status, title, caption, reason = make_caption(p, PROMPT, FOOTER, sig_by.get(src, ""), rewrite_mode)
                 if status == "quota":
                     print(tag, "лимиты обеих моделей исчерпаны, остановка до следующего запуска")
                     stop = True
@@ -648,6 +786,32 @@ async def main():
         state["_fails"] = fails
         json.dump(state, open(STATE, "w"))
     print(f"Всего отправлено: {sent}, дублей: {dups}, отклонено ИИ: {skipped_ai}, запросов к ИИ: {ai_calls}")
+
+
+async def main():
+    print("Версия repost.py:", VERSION)
+    cfg = load_config()
+    if bootstrap(cfg):
+        save_config(cfg)
+        print("Каналы перенесены из секретов GitHub в config.json. Дальше ими можно управлять через бота.")
+    only = os.environ.get("PROFILE", "").strip()
+    profs = {k: v for k, v in (cfg.get("profiles") or {}).items()
+             if v.get("enabled", True) and norm_sources(v) and v.get("target") and (not only or only == k)}
+    if not profs:
+        print("Нет настроенных каналов (config.json пуст). Добавь канал через бота.")
+        return
+    async with TelegramClient(StringSession(SESSION), API_ID, API_HASH) as client:
+        numeric = [x for v in profs.values() for x in [v["target"]] + [sc["id"] for sc in norm_sources(v)]
+                   if re.fullmatch(r"-?\d+", str(x))]
+        if numeric:        # закрытые каналы по числовому id: Telethon должен сначала «увидеть» их среди диалогов
+            await client.get_dialogs()
+        for name, prof in profs.items():
+            print(f"\n===== Канал «{prof.get('title') or name}» -> {prof['target']} "
+                  f"(режим: {prof.get('mode', 'new')}) =====")
+            try:
+                await run_profile(client, name, prof)
+            except Exception as e:
+                print(f"[{name}] ошибка, перехожу к следующему каналу: {e}")
 
 
 if __name__ == "__main__":
