@@ -26,7 +26,7 @@ SUBS = CC.get("subs", True)                                         # русск
 ENABLED = CC.get("enabled", True)
 SMART = CC.get("smart", True)                                       # сначала понять смысл всего видео, резать только моменты обзора
 DUB = CC.get("dub", True)                                           # русская озвучка поверх оригинала
-DUB_ENGINE = (CC.get("dub_engine") or "auto").lower()               # edge = голос Microsoft (точнее по времени), auto = сначала Gemini TTS
+DUB_ENGINE = (CC.get("dub_engine") or "edge").lower()               # edge = голос Microsoft (точнее по времени), auto = сначала Gemini TTS
 if CC.get("voice"):
     S.VOICE = CC["voice"]                                           # например ru-RU-DmitryNeural или ru-RU-SvetlanaNeural
 CHARS_PER_SEC = 15                                                  # сколько русских символов диктор произносит за секунду
@@ -40,15 +40,36 @@ SUB_Y, CTA_Y, CTA_H = 1280, 1440, 120      # положение субтитро
 # ---------- RSS и скачивание ----------
 
 def fetch_feed():
-    r = requests.get(f"https://www.youtube.com/feeds/videos.xml?channel_id={CHANNEL_ID}", timeout=30)
-    r.raise_for_status()
-    ns = {"a": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015",
-          "m": "http://search.yahoo.com/mrss/"}
-    out = []
-    for e in ET.fromstring(r.content).findall("a:entry", ns):
-        out.append(dict(id=e.find("yt:videoId", ns).text, title=(e.find("a:title", ns).text or "").strip(),
-                        desc=(e.findtext("m:group/m:description", default="", namespaces=ns) or "").strip()))
-    return out
+    # 1) RSS (быстро), 2) если не вышло, yt-dlp со списком видео канала
+    try:
+        r = requests.get(f"https://www.youtube.com/feeds/videos.xml?channel_id={CHANNEL_ID}", timeout=30)
+        r.raise_for_status()
+        ns = {"a": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015",
+              "m": "http://search.yahoo.com/mrss/"}
+        out = []
+        for e in ET.fromstring(r.content).findall("a:entry", ns):
+            out.append(dict(id=e.find("yt:videoId", ns).text, title=(e.find("a:title", ns).text or "").strip(),
+                            desc=(e.findtext("m:group/m:description", default="", namespaces=ns) or "").strip()))
+        if out:
+            return out
+    except Exception as ex:
+        print(f"  RSS не сработал ({ex}), пробую yt-dlp")
+
+    extra = []
+    cookies = os.environ.get("YT_COOKIES", "").strip()
+    if cookies:
+        os.makedirs(WORK, exist_ok=True)
+        open(f"{WORK}/cookies.txt", "w", encoding="utf-8").write(cookies + "\n")
+        extra = ["--cookies", f"{WORK}/cookies.txt"]
+    p = subprocess.run([sys.executable, "-m", "yt_dlp"] + extra +
+                       ["--flat-playlist", "--playlist-end", "15", "-J",
+                        f"https://www.youtube.com/channel/{CHANNEL_ID}/videos"],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        raise RuntimeError("yt-dlp не получил список видео: " + p.stderr[-500:])
+    data = json.loads(p.stdout)
+    return [dict(id=e["id"], title=(e.get("title") or "").strip(), desc=(e.get("description") or "").strip())
+            for e in data.get("entries", []) if e.get("id")]
 
 
 def download(vid):
