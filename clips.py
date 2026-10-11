@@ -26,9 +26,13 @@ SUBS = CC.get("subs", True)                                         # русск
 ENABLED = CC.get("enabled", True)
 SMART = CC.get("smart", True)                                       # сначала понять смысл всего видео, резать только моменты обзора
 DUB = CC.get("dub", True)                                           # русская озвучка поверх оригинала
-DUB_ENGINE = (CC.get("dub_engine") or "edge").lower()               # edge = голос Microsoft (точнее по времени), auto = сначала Gemini TTS
+REQUIRE_DUB = CC.get("require_dub", True)                           # True: ролик без озвучки не публикуется, повторим в следующий запуск
+S.TTS_ENGINE = "gemini"                                             # озвучка только Gemini TTS
 if CC.get("voice"):
-    S.VOICE = CC["voice"]                                           # например ru-RU-DmitryNeural или ru-RU-SvetlanaNeural
+    S.GEMINI_VOICE = CC["voice"]                                    # Puck, Fenrir, Charon, Kore, Leda...
+OUTRO = CC.get("outro") or "Скачать этот мод можно в моём Телеграм-канале."   # фраза в конце каждого ролика
+OUTRO_SUB = "Скачать мод можно в моём Telegram-канале"
+TITLE_FMT = CC.get("title_fmt") or "Обзор мода «{mod}» на телефон"
 CHARS_PER_SEC = 15                                                  # сколько русских символов диктор произносит за секунду
 MAX_TEMPO = 1.45                                                    # максимум ускорения озвучки, чтобы влезть в оригинальный тайминг
 ORIG_VOL = 0.55                                                     # громкость оригинального звука под голосом (звуки игры остаются)
@@ -223,7 +227,9 @@ def analyze_video(video, cues, duration):
         '- "intro": приветствие, тизер, «в этом видео»; "chat": болтовня, просьбы подписаться, личное; '
         '"ad": реклама, спонсор, ссылки; "outro": прощание; "other": остальное.\n'
         "Кратко (по-русски) напиши what: что именно показывают в этой части. И общий summary на 2-3 предложения.\n"
-        'Верни ТОЛЬКО JSON: {"summary": "...", "sections": [{"start": сек, "end": сек, "kind": "review", "what": "..."}]}\n\n'
+        "Ещё укажи mod_name: название мода/аддона/пака/карты, как оно пишется в оригинале (латиницей), без слов "
+        "Minecraft, Bedrock, addon, mod, до 35 символов.\n"
+        'Верни ТОЛЬКО JSON: {"mod_name": "...", "summary": "...", "sections": [{"start": сек, "end": сек, "kind": "review", "what": "..."}]}\n\n'
         f"Название: {video['title']}\nОписание: {video['desc'][:700]}\n\nСубтитры:\n{tr}")
 
     def check(d):
@@ -238,6 +244,7 @@ def analyze_video(video, cues, duration):
             return False
         d["sections"] = sorted(good, key=lambda x: x["start"])
         d["summary"] = str(d.get("summary", ""))[:600]
+        d["mod_name"] = re.sub(r"[\"«»]", "", str(d.get("mod_name", ""))).strip()[:35]
         return any(x["kind"] == "review" for x in good)
 
     return S.gemini_raw(prompt, check)
@@ -267,9 +274,7 @@ def pick_clips(video, info, cues, duration):
         "там, где автор прямо показывает фишку аддона/мода/карты или изменение, и это понятно без остального видео. "
         "Отрезок начинай с начала мысли (сразу с показа, без «так, давайте посмотрим»), заканчивай на конце фразы. "
         "Не бери интро, болтовню, рекламу, просьбы подписаться. Отрезки не пересекаются, лучше из разных частей.\n"
-        "Для каждого: title: заголовок на РУССКОМ до 45 символов без эмодзи; yt_title: русское название для YouTube "
-        "до 85 символов со словом Minecraft.\n"
-        'Верни ТОЛЬКО JSON: {"clips": [{"start": сек, "end": сек, "title": "...", "yt_title": "..."}]}\n\n'
+        'Верни ТОЛЬКО JSON: {"clips": [{"start": сек, "end": сек}]}\n\n'
         f"Название видео: {video['title']}\n\nСубтитры частей review:\n" + "\n".join(lines)[:90000])
 
     def check(d):
@@ -320,7 +325,14 @@ def plan_clips_smart(video, cues, duration):
     print(f"  частей: {len(info['sections'])}, из них обзор: {len(rev)}, "
           f"{sum(x['end'] - x['start'] for x in rev):.0f} с")
     clips = pick_clips(video, info, cues, duration) or clips_from_sections(video, info, cues)
-    return clips or plan_clips(video, cues, duration)
+    if not clips:
+        return plan_clips(video, cues, duration)
+    mod = info.get("mod_name")
+    if mod:                                    # название сверху и название на YouTube задаём сами, без запроса к Gemini
+        for c in clips:
+            c["title"] = TITLE_FMT.format(mod=mod)
+            c["yt_title"] = f"{c['title']} | Minecraft Bedrock"[:95]
+    return clips
 
 
 # ---------- русская озвучка ----------
@@ -332,8 +344,8 @@ def make_segments(cues, st, en):
         a, b = max(a, st), min(b, en)
         if b - a < 0.05:
             continue
-        if cur and (a - cur[1] > 0.8 or cur[1] - cur[0] >= 6.5
-                    or (cur[2].rstrip()[-1:] in ".?!" and cur[1] - cur[0] >= 2.0)):
+        if cur and (a - cur[1] > 0.8 or cur[1] - cur[0] >= 8.0
+                    or (cur[2].rstrip()[-1:] in ".?!" and cur[1] - cur[0] >= 3.5)):
             segs.append(tuple(cur))
             cur = None
         cur = [cur[0], b, cur[2] + " " + t] if cur else [a, b, t]
@@ -369,28 +381,19 @@ def translate_segments(segs, video):
 
 
 async def synth(say):
-    """Озвучивает куски по одному (так тайминг точный). Возвращает [(длительность, файл)] или None."""
+    """Озвучка ТОЛЬКО Gemini TTS, весь ролик одним запросом (плюс финальная фраза). Если первая модель не справилась,
+    shorts.gemini_tts_batch пробует вторую, но не больше двух запросов. Возвращает [(длительность, файл)] или None."""
     os.makedirs(S.WORK, exist_ok=True)
-    os.makedirs(WORK, exist_ok=True)
-    if DUB_ENGINE == "auto":
-        pre = await S.gemini_tts_batch(say)
-        if pre and len(pre) == len(say):
-            return pre
-    out = []
-    for i, text in enumerate(say):
-        d, f = await S.tts(text, f"{WORK}/tts{i}.wav")
-        if not f:
-            print(f"  озвучка куска {i + 1} не получилась")
-            return None
-        out.append((d, f))
-    return out
+    parts = await S.gemini_tts_batch(say)
+    return parts if parts and len(parts) == len(say) else None
 
 
 def schedule(segs, tts, st, dur):
     """Раскладывает куски озвучки по времени: ускоряет, если русский длиннее оригинала, и не даёт им накладываться.
     Возвращает ([(начало, длина, темп, файл)], во сколько закончится озвучка) в секундах от начала нарезки."""
     items, cursor = [], 0.0
-    for i, ((a, b, _), (d, f)) in enumerate(zip(segs, tts)):
+    n = len(segs)
+    for i, ((a, b, _), (d, f)) in enumerate(zip(segs, tts[:n])):
         a0 = a - st
         nxt = (segs[i + 1][0] - st) if i + 1 < len(segs) else dur
         start = max(a0, cursor)
@@ -399,6 +402,9 @@ def schedule(segs, tts, st, dur):
         real = d / tempo
         items.append((start, real, tempo, f))
         cursor = start + real + 0.1
+    if len(tts) > n:                         # финальная фраза «скачать можно в телеграм-канале» сразу после речи
+        d, f = tts[n]
+        items.append((cursor + 0.1, d, 1.0, f))
     return items, (items[-1][0] + items[-1][1] if items else 0.0)
 
 
@@ -537,6 +543,11 @@ async def main():
     S.ensure_fonts()
     state = json.load(open(STATE)) if os.path.exists(STATE) else {}
     done = set(state.get("done", []))
+    S.tts_state["block"].update(state.get("tts_block", {}))          # модели TTS, у которых сегодня кончился лимит
+    try:                                                             # то же знает бот shorts: лимит у них общий (один ключ)
+        S.tts_state["block"].update(json.load(open("shorts_state.json", encoding="utf-8")).get("tts_block", {}))
+    except Exception:
+        pass
     feed = fetch_feed()
     print(f"В ленте канала {AUTHOR}: {len(feed)} видео, новых: {sum(1 for v in feed if v['id'] not in done)}")
     results = []
@@ -558,25 +569,29 @@ async def main():
                 continue
             cues = parse_vtt(vtt) if vtt else []
             clips = plan_clips_smart(video, cues, duration)
+            failed = False
             for n, clip in enumerate(clips, 1):
                 print(tag, f"нарезка {n}/{len(clips)}: {clip['start']:.0f}-{clip['end']:.0f} с, «{clip['title']}»")
                 window = [c for c in cues if c[1] > clip["start"] and c[0] < clip["end"]]
                 sub_cues, dub = [], None
-                if DUB and window:                       # озвучка: перевод цельными кусками + голос + субтитры в такт
+                if DUB and window:                       # озвучка: перевод цельными кусками + Gemini TTS + субтитры в такт
                     st0, en0 = clip["start"], clip["end"]
                     segs = make_segments(window, st0, en0)
                     tr = translate_segments(segs, video) if segs else None
-                    tts = await synth(tr[1]) if tr else None
+                    tts = await synth(tr[1] + [OUTRO]) if tr else None
                     if tr and tts:
                         items, need = schedule(segs, tts, st0, en0 - st0)
-                        if need > en0 - st0:             # русская речь длиннее: чуть продлеваем ролик, чтобы не обрезать
-                            clip["end"] = min(st0 + 59.0, duration - 0.2, st0 + need + 0.3)
+                        clip["end"] = min(st0 + 59.0, duration - 0.2, st0 + need + 0.6)   # ролик заканчивается сразу после финальной фразы
                         dur_ = clip["end"] - st0
                         dub = f"{WORK}/dub{n}.wav"
                         mix_dub(items, dur_, dub)
                         clip["dubbed"] = True
                         if SUBS:
-                            sub_cues = [(st0 + it[0], st0 + it[0] + it[1], t) for it, t in zip(items, tr[0])]
+                            sub_cues = [(st0 + it[0], st0 + it[0] + it[1], t) for it, t in zip(items, tr[0] + [OUTRO_SUB])]
+                    elif REQUIRE_DUB:
+                        print(tag, "озвучка Gemini TTS не получилась (лимит или сбой), ролик без голоса не публикую, повторю в следующий запуск")
+                        failed = True
+                        break
                     else:
                         print(tag, "озвучка не получилась, делаю ролик с субтитрами и оригинальным звуком")
                 if not dub and SUBS and window:
@@ -595,10 +610,13 @@ async def main():
                     except Exception as e:
                         print(tag, "YouTube не принял:", e)
                 results.append((out, clip, link))
-            done.add(video["id"])
+            if not failed or results:                  # если озвучка не вышла у первой же нарезки, видео попробуем снова
+                done.add(video["id"])
             break                      # одно видео за запуск
     finally:
         state["done"] = sorted(done)[-300:]
+        today = S.pacific_today()
+        state["tts_block"] = {m: d for m, d in S.tts_state["block"].items() if d == today}
         json.dump(state, open(STATE, "w"))
     if results:
         async with S.TelegramClient(S.StringSession(S.SESSION), S.API_ID, S.API_HASH) as client:
