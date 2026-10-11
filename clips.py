@@ -31,6 +31,11 @@ S.TTS_ENGINE = "gemini"                                             # озвуч
 if CC.get("voice"):
     S.GEMINI_VOICE = CC["voice"]                                    # Puck, Fenrir, Charon, Kore, Leda...
 OUTRO = CC.get("outro") or "Скачать этот мод можно в моём Телеграм-канале."   # фраза в конце каждого ролика
+STORY = CC.get("story", True)                                       # один связный ролик: вступление с объяснением мода + несколько моментов обзора
+TOTAL_MAX = min(170, int(CC.get("max_total") or 75))                # максимум длины связного ролика, сек (Shorts до 3 минут)
+TOTAL_CAP = 175.0
+PARTS = max(2, min(5, int(CC.get("parts") or 3)))                   # из скольких моментов собирать ролик
+PART_MIN, PART_MAX = 8, 30                                          # длина одного момента, сек
 OUTRO_SUB = "Скачать мод можно в моём Telegram-канале"
 TITLE_FMT = CC.get("title_fmt") or "Обзор мода «{mod}» на телефон"
 CHARS_PER_SEC = 15                                                  # сколько русских символов диктор произносит за секунду
@@ -198,7 +203,7 @@ def translate(texts):
 
 # ---------- умный выбор: сначала смысл всего видео ----------
 
-def _snap_clip(cues, st, en):
+def _snap_clip(cues, st, en, lo=None, hi=None):
     """Двигает границы к границам фраз: начало на старт реплики, конец на конец (лучше там, где стоит точка)."""
     starts = [c[0] for c in cues]
     s = min(starts, key=lambda x: abs(x - st))
@@ -209,14 +214,20 @@ def _snap_clip(cues, st, en):
         e = min(near, key=lambda c: (c[2].rstrip()[-1:] not in ".?!", abs(c[1] - en)))[1]
     else:
         e = en
-    if e - s > MAX_LEN:
-        ok = [c[1] for c in cues if s + MIN_LEN <= c[1] <= s + MAX_LEN]
-        e = max(ok) if ok else s + MAX_LEN
+    lo, hi = lo or MIN_LEN, hi or MAX_LEN
+    if e - s > hi:
+        ok = [c[1] for c in cues if s + lo <= c[1] <= s + hi]
+        e = max(ok) if ok else s + hi
     return s, e
+
+
+_info_cache = {}
 
 
 def analyze_video(video, cues, duration):
     """Этап 1. Gemini читает ВСЕ субтитры и размечает видео: где обзор аддона/мода/карты, а где болтовня, реклама, интро."""
+    if video["id"] in _info_cache:               # анализ делаем один раз на видео
+        return _info_cache[video["id"]]
     tr = "\n".join(f"[{int(a)}] {t[:200]}" for a, b, t in cues)[:150000]
     prompt = (
         f"Ты редактор. Ниже полные английские субтитры видео автора {AUTHOR} про Minecraft Bedrock (аддон, мод, карта, "
@@ -229,7 +240,11 @@ def analyze_video(video, cues, duration):
         "Кратко (по-русски) напиши what: что именно показывают в этой части. И общий summary на 2-3 предложения.\n"
         "Ещё укажи mod_name: название мода/аддона/пака/карты, как оно пишется в оригинале (латиницей), без слов "
         "Minecraft, Bedrock, addon, mod, до 35 символов.\n"
-        'Верни ТОЛЬКО JSON: {"mod_name": "...", "summary": "...", "sections": [{"start": сек, "end": сек, "kind": "review", "what": "..."}]}\n\n'
+        "И вступление для диктора: intro_ru: 1-2 предложения по-русски (до 220 символов), что именно этот мод меняет "
+        "в игре (например: «Мод Vibrance меняет освещение, воду и небо: ...»). Опирайся на ВСЁ видео, без приветствий, "
+        "слов «обзор» и «сегодня». intro_say: тот же текст, но английские названия записаны русскими буквами так, "
+        "как их произносят, числа словами.\n"
+        'Верни ТОЛЬКО JSON: {"mod_name": "...", "intro_ru": "...", "intro_say": "...", "summary": "...", "sections": [{"start": сек, "end": сек, "kind": "review", "what": "..."}]}\n\n'
         f"Название: {video['title']}\nОписание: {video['desc'][:700]}\n\nСубтитры:\n{tr}")
 
     def check(d):
@@ -245,9 +260,14 @@ def analyze_video(video, cues, duration):
         d["sections"] = sorted(good, key=lambda x: x["start"])
         d["summary"] = str(d.get("summary", ""))[:600]
         d["mod_name"] = re.sub(r"[\"«»]", "", str(d.get("mod_name", ""))).strip()[:35]
+        d["intro_ru"] = str(d.get("intro_ru", "")).strip()[:260]
+        d["intro_say"] = str(d.get("intro_say", "")).strip()[:300] or d["intro_ru"]
         return any(x["kind"] == "review" for x in good)
 
-    return S.gemini_raw(prompt, check)
+    info = S.gemini_raw(prompt, check)
+    if info:
+        _info_cache[video["id"]] = info
+    return info
 
 
 def _review_share(info, st, en):
@@ -337,15 +357,15 @@ def plan_clips_smart(video, cues, duration):
 
 # ---------- русская озвучка ----------
 
-def make_segments(cues, st, en):
+def make_segments(cues, st, en, max_dur=8.0, min_sent=3.5):
     """Склеивает мелкие реплики субтитров в законченные куски речи (2-6 с), чтобы перевод был цельным."""
     segs, cur = [], None
     for a, b, t in cues:
         a, b = max(a, st), min(b, en)
         if b - a < 0.05:
             continue
-        if cur and (a - cur[1] > 0.8 or cur[1] - cur[0] >= 8.0
-                    or (cur[2].rstrip()[-1:] in ".?!" and cur[1] - cur[0] >= 3.5)):
+        if cur and (a - cur[1] > 0.8 or cur[1] - cur[0] >= max_dur
+                    or (cur[2].rstrip()[-1:] in ".?!" and cur[1] - cur[0] >= min_sent)):
             segs.append(tuple(cur))
             cur = None
         cur = [cur[0], b, cur[2] + " " + t] if cur else [a, b, t]
@@ -354,7 +374,7 @@ def make_segments(cues, st, en):
     return segs
 
 
-def translate_segments(segs, video):
+def translate_segments(segs, video, ctx=""):
     """Перевод для озвучки: ru (для субтитров) и say (для голоса, английские названия записаны по-русски).
     Длина каждой фразы ограничена временем, которое у неё есть. Возвращает (ru, say) или None."""
     n = len(segs)
@@ -370,7 +390,7 @@ def translate_segments(segs, video):
         "оригинале); say: тот же текст для диктора, где английские названия и слова записаны русскими буквами "
         "так, как их произносят (Minecraft -> Майнкрафт), без цифр-аббревиатур, числа словами.\n"
         f'Верни ТОЛЬКО JSON {{"ru": [...], "say": [...]}}, в каждом ровно {n} строк, в том же порядке.\n\n'
-        f"Видео: {video['title']}\n\n" + "\n".join(rows))
+        f"Видео: {video['title']}\n" + (f"О чём видео: {ctx}\n" if ctx else "") + "\n" + "\n".join(rows))
     d = S.gemini_raw(prompt, lambda x: isinstance(x.get("ru"), list) and isinstance(x.get("say"), list)
                      and len(x["ru"]) == n and len(x["say"]) == n)
     if not d:
@@ -534,7 +554,200 @@ def description(video, clip):
             "#Shorts #Minecraft #MinecraftBedrock")
 
 
+# ---------- связный ролик: вступление + несколько моментов ----------
+
+def pick_story(video, info, cues, duration):
+    """Gemini выбирает 2-N моментов из частей обзора, которые вместе рассказывают про мод. Возвращает [{start,end}] или None."""
+    budget = max(25, TOTAL_MAX - 16)             # из общей длины вычитаем вступление (~12 с) и финальную фразу (~4 с)
+    rev = [x for x in info["sections"] if x["kind"] == "review"]
+    lines = [f"[{int(a)}] {t[:160]}" for a, b, t in cues if any(x["start"] - 1 <= a <= x["end"] + 1 for x in rev)]
+    outline = "\n".join(f"- {x['start']:.0f}-{x['end']:.0f} с ({x['kind']}): {x['what']}" for x in info["sections"])
+    prompt = (
+        f"Ты редактор вертикального ролика про Minecraft Bedrock. Смысл видео автора {AUTHOR}: {info['summary']}\n"
+        f"Структура видео:\n{outline}\n\n"
+        f"Собери из видео ОДИН связный ролик: выбери от 2 до {PARTS} отрезков ТОЛЬКО из частей review, каждый "
+        f"{PART_MIN}-{PART_MAX} секунд, в сумме не больше {budget} секунд. Расставь их в порядке видео, чтобы получился "
+        "рассказ: каждый отрезок про свою фишку мода (что меняется), без повторов и пересечений. Начало отрезка на "
+        "начале мысли (сразу показ), конец на конце фразы. Без болтовни, рекламы и просьб подписаться.\n"
+        'Верни ТОЛЬКО JSON: {"parts": [{"start": сек, "end": сек}]}\n\n'
+        f"Название видео: {video['title']}\n\nСубтитры частей review:\n" + "\n".join(lines)[:90000])
+
+    def check(d):
+        good, last_end, total = [], -1, 0.0
+        try:
+            for c in sorted(d["parts"], key=lambda c: float(c["start"])):
+                st, en = _snap_clip(cues, float(c["start"]), float(c["end"]), PART_MIN, PART_MAX)
+                if st < 0 or en > duration + 1 or en - st < PART_MIN - 3 or st < last_end:
+                    continue
+                if _review_share(info, st, en) < 0.7 or total + (en - st) > budget:
+                    continue
+                good.append(dict(start=st, end=en))
+                last_end, total = en, total + (en - st)
+        except Exception:
+            return False
+        d["parts"] = good[:PARTS]
+        return bool(good)
+
+    d = S.gemini_raw(prompt, check)
+    return d["parts"] if d else None
+
+
+def parts_from_sections(info, cues):
+    """Запасной вариант: начала самых длинных частей обзора."""
+    budget, total, out = max(25, TOTAL_MAX - 16), 0.0, []
+    rev = sorted([x for x in info["sections"] if x["kind"] == "review"], key=lambda x: x["start"] - x["end"])
+    for x in rev:
+        st, en = _snap_clip(cues, x["start"], min(x["end"], x["start"] + PART_MAX), PART_MIN, PART_MAX)
+        if en - st >= PART_MIN - 3 and total + (en - st) <= budget:
+            out.append(dict(start=st, end=en))
+            total += en - st
+        if len(out) >= PARTS:
+            break
+    return sorted(out, key=lambda p: p["start"])
+
+
+def plan_story(video, cues, duration):
+    """Двухэтапный план связного ролика. None, если не вышло (тогда работает прежний режим нарезок)."""
+    info = analyze_video(video, cues, duration)
+    if not info:
+        print("  анализ всего видео не удался")
+        return None
+    parts = pick_story(video, info, cues, duration) or parts_from_sections(info, cues)
+    if not parts:
+        return None
+    mod = info.get("mod_name")
+    title = TITLE_FMT.format(mod=mod) if mod else video["title"][:45]
+    intro_start = min((x["start"] for x in info["sections"] if x["kind"] == "intro"), default=0.0)
+    print(f"  смысл видео: {info['summary'][:200]}")
+    print(f"  вступление: {info['intro_ru'][:160]}")
+    print("  моменты:", ", ".join(f"{p['start']:.0f}-{p['end']:.0f}" for p in parts))
+    return dict(parts=parts, mod=mod, title=title, summary=info["summary"], intro_ru=info["intro_ru"],
+                intro_say=info["intro_say"], intro_start=intro_start,
+                yt_title=(f"{title} | Minecraft Bedrock" if mod else video["title"])[:95])
+
+
+def assemble(src, pieces, out):
+    """Склеивает куски исходного видео в один файл. pieces: [(начало, длина, без_звука)]."""
+    cmd, fc = ["ffmpeg", "-y"], []
+    for i, (a, d, mute) in enumerate(pieces):
+        cmd += ["-ss", f"{a:.2f}", "-t", f"{d:.2f}", "-i", src]
+        fc.append(f"[{i}:v]scale={S.W}:-2,setsar=1,fps=30,format=yuv420p[v{i}]")
+        fc.append(f"[{i}:a:0]aresample=44100,aformat=channel_layouts=stereo{',volume=0' if mute else ''}[a{i}]")
+    n = len(pieces)
+    fc.append("".join(f"[v{i}][a{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=1[v][a]")
+    cmd += ["-filter_complex", ";".join(fc), "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast",
+            "-crf", "18", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out]
+    S.run(cmd)
+
+
+async def build_story(video, src, cues, duration, story, tag):
+    """Собирает связный ролик: вступление (картинка автора без его звука + голос о том, что меняет мод), потом моменты
+    обзора с русской озвучкой, в конце фраза про Telegram. ОДИН запрос Gemini TTS на весь ролик.
+    Возвращает (файл, clip) или None."""
+    parts = story["parts"]
+    segs, off = [], 0.0                           # куски речи на общей шкале времени ролика (без вступления)
+    for p in parts:
+        window = [c for c in cues if c[1] > p["start"] and c[0] < p["end"]]
+        for a, b, t in make_segments(window, p["start"], p["end"], 10.0, 5.0):
+            segs.append((a - p["start"] + off, b - p["start"] + off, t))
+        off += p["end"] - p["start"]
+    if not segs:
+        return None
+    tr = translate_segments(segs, video, story["summary"])
+    if not tr:
+        print(tag, "перевод не получился")
+        return None
+    ru, say = tr
+    intro = bool(story.get("intro_say"))
+    tts = await synth(([story["intro_say"]] if intro else []) + say + [OUTRO])
+    if not tts:
+        return None
+    L0, intro_item = 0.0, []
+    if intro:                                      # вступление: длина картинки = длина голоса (до 15 с)
+        d, f = tts[0]
+        tempo = min(MAX_TEMPO, d / 15.0) if d > 15.0 else 1.0
+        real = d / tempo
+        L0 = real + 0.6
+        intro_item = [(0.2, real, tempo, f)]
+        tts = tts[1:]
+    shifted = [(a + L0, b + L0, t) for a, b, t in segs]
+    items, need = schedule(shifted, tts, 0.0, off + L0)
+    total = min(TOTAL_CAP, need + 0.6)
+    last = dict(parts[-1])                         # последний момент подгоняем так, чтобы ролик кончился сразу после финальной фразы
+    last_start = L0 + off - (last["end"] - last["start"])
+    last["end"] = min(duration - 0.1, last["start"] + max(3.0, total - last_start))
+    total = last_start + (last["end"] - last["start"])
+    parts = parts[:-1] + [last]
+    pieces = []
+    if intro:
+        pieces.append((max(0.0, min(story["intro_start"], duration - L0 - 0.1)), L0, True))
+    pieces += [(p["start"], p["end"] - p["start"], False) for p in parts]
+    asm = f"{WORK}/story_src.mp4"
+    assemble(src, pieces, asm)
+    dub = f"{WORK}/dub_story.wav"
+    mix_dub(intro_item + items, total, dub)
+    sub_cues = []
+    if SUBS:
+        texts = ([story["intro_ru"]] if intro else []) + ru + [OUTRO_SUB]
+        sub_cues = [(it[0], it[0] + it[1], t) for it, t in zip(intro_item + items, texts)]
+    clip = dict(start=0.0, end=total, title=story["title"], yt_title=story["yt_title"], dubbed=True)
+    out = f"{WORK}/story.mp4"
+    render(asm, clip, sub_cues, out, dub)
+    return out, clip
+
+
+def upload(video, out, clip, tag):
+    if S.YT_ID and S.YT_SECRET and S.YT_REFRESH:
+        try:
+            link = S.youtube_upload(out, clip["yt_title"], description(video, clip))
+            print(tag, "загружено на YouTube:", link)
+            return link
+        except Exception as e:
+            print(tag, "YouTube не принял:", e)
+    return ""
+
+
 # ---------- основной цикл ----------
+
+async def legacy_clips(video, src, cues, duration, tag, results):
+    """Прежний режим: отдельные нарезки (каждая со своей озвучкой). Возвращает True, если озвучка не получилась."""
+    clips = plan_clips_smart(video, cues, duration)
+    failed = False
+    for n, clip in enumerate(clips, 1):
+        print(tag, f"нарезка {n}/{len(clips)}: {clip['start']:.0f}-{clip['end']:.0f} с, «{clip['title']}»")
+        window = [c for c in cues if c[1] > clip["start"] and c[0] < clip["end"]]
+        sub_cues, dub = [], None
+        if DUB and window:                       # озвучка: перевод цельными кусками + Gemini TTS + субтитры в такт
+            st0, en0 = clip["start"], clip["end"]
+            segs = make_segments(window, st0, en0)
+            tr = translate_segments(segs, video) if segs else None
+            tts = await synth(tr[1] + [OUTRO]) if tr else None
+            if tr and tts:
+                items, need = schedule(segs, tts, st0, en0 - st0)
+                clip["end"] = min(st0 + 59.0, duration - 0.2, st0 + need + 0.6)   # ролик заканчивается сразу после финальной фразы
+                dur_ = clip["end"] - st0
+                dub = f"{WORK}/dub{n}.wav"
+                mix_dub(items, dur_, dub)
+                clip["dubbed"] = True
+                if SUBS:
+                    sub_cues = [(st0 + it[0], st0 + it[0] + it[1], t) for it, t in zip(items, tr[0] + [OUTRO_SUB])]
+            elif REQUIRE_DUB:
+                print(tag, "озвучка Gemini TTS не получилась (лимит или сбой), ролик без голоса не публикую, повторю в следующий запуск")
+                failed = True
+                break
+            else:
+                print(tag, "озвучка не получилась, делаю ролик с субтитрами и оригинальным звуком")
+        if not dub and SUBS and window:
+            ru = translate([c[2] for c in window])
+            if ru:
+                sub_cues = [(a, b, t) for (a, b, _), t in zip(window, ru)]
+            else:
+                print(tag, "перевод не получился, ролик без субтитров")
+        out = f"{WORK}/clip{n}.mp4"
+        render(src, clip, sub_cues, out, dub)
+        results.append((out, clip, upload(video, out, clip, tag)))
+    return failed
+
 
 async def main():
     if not ENABLED:
@@ -568,48 +781,22 @@ async def main():
                 done.add(video["id"])
                 continue
             cues = parse_vtt(vtt) if vtt else []
-            clips = plan_clips_smart(video, cues, duration)
             failed = False
-            for n, clip in enumerate(clips, 1):
-                print(tag, f"нарезка {n}/{len(clips)}: {clip['start']:.0f}-{clip['end']:.0f} с, «{clip['title']}»")
-                window = [c for c in cues if c[1] > clip["start"] and c[0] < clip["end"]]
-                sub_cues, dub = [], None
-                if DUB and window:                       # озвучка: перевод цельными кусками + Gemini TTS + субтитры в такт
-                    st0, en0 = clip["start"], clip["end"]
-                    segs = make_segments(window, st0, en0)
-                    tr = translate_segments(segs, video) if segs else None
-                    tts = await synth(tr[1] + [OUTRO]) if tr else None
-                    if tr and tts:
-                        items, need = schedule(segs, tts, st0, en0 - st0)
-                        clip["end"] = min(st0 + 59.0, duration - 0.2, st0 + need + 0.6)   # ролик заканчивается сразу после финальной фразы
-                        dur_ = clip["end"] - st0
-                        dub = f"{WORK}/dub{n}.wav"
-                        mix_dub(items, dur_, dub)
-                        clip["dubbed"] = True
-                        if SUBS:
-                            sub_cues = [(st0 + it[0], st0 + it[0] + it[1], t) for it, t in zip(items, tr[0] + [OUTRO_SUB])]
-                    elif REQUIRE_DUB:
-                        print(tag, "озвучка Gemini TTS не получилась (лимит или сбой), ролик без голоса не публикую, повторю в следующий запуск")
-                        failed = True
-                        break
-                    else:
-                        print(tag, "озвучка не получилась, делаю ролик с субтитрами и оригинальным звуком")
-                if not dub and SUBS and window:
-                    ru = translate([c[2] for c in window])
-                    if ru:
-                        sub_cues = [(a, b, t) for (a, b, _), t in zip(window, ru)]
-                    else:
-                        print(tag, "перевод не получился, ролик без субтитров")
-                out = f"{WORK}/clip{n}.mp4"
-                render(src, clip, sub_cues, out, dub)
-                link = ""
-                if S.YT_ID and S.YT_SECRET and S.YT_REFRESH:
-                    try:
-                        link = S.youtube_upload(out, clip["yt_title"], description(video, clip))
-                        print(tag, "загружено на YouTube:", link)
-                    except Exception as e:
-                        print(tag, "YouTube не принял:", e)
-                results.append((out, clip, link))
+            reel_done = False
+            story = plan_story(video, cues, duration) if (STORY and DUB and SMART and cues) else None
+            if story:                                   # связный ролик: вступление + моменты + финальная фраза
+                reel = await build_story(video, src, cues, duration, story, tag)
+                if reel:
+                    out, clip = reel
+                    results.append((out, clip, upload(video, out, clip, tag)))
+                    reel_done = True
+                elif REQUIRE_DUB:
+                    print(tag, "связный ролик не собрался (озвучка Gemini TTS или перевод), повторю в следующий запуск")
+                    failed = True
+                else:
+                    print(tag, "связный ролик не собрался, делаю обычные нарезки")
+            if not reel_done and not failed:
+                failed = await legacy_clips(video, src, cues, duration, tag, results)
             if not failed or results:                  # если озвучка не вышла у первой же нарезки, видео попробуем снова
                 done.add(video["id"])
             break                      # одно видео за запуск
