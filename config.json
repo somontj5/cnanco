@@ -136,6 +136,12 @@
      "sig": "от: Команды Лололошки ST",
      "only_video": false,
      "from_id": 0
+    },
+    {
+     "id": "@Lololoshka_TM",
+     "sig": "",
+     "only_video": false,
+     "from_id": 0
     }
    ],
    "filter": "soft"
