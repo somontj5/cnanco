@@ -133,7 +133,14 @@
    "first_run_hours": 999,
    "state_file": "state_chlololoshkaus.json",
    "enabled": true,
-   "sources": []
+   "sources": [
+    {
+     "id": "@MrLololoshka_EDIT",
+     "sig": "от: Фанат №1",
+     "only_video": false,
+     "from_id": 0
+    }
+   ]
   }
  }
 }
