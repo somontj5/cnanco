@@ -141,12 +141,14 @@ def v_profile(cfg, pid):
             f"Переписывать ИИ: {'да' if p.get('rewrite', 'ai') == 'ai' else 'нет, текст как есть'}\n"
             f"Постов за запуск: {p.get('per_run', 10)}\n"
             f"Тема: {p.get('topic') or 'Minecraft Bedrock'}\n"
+            f"Фильтр постов: {'мягкий (фандом: разговорные, новости, фан-арты)' if p.get('filter') == 'soft' else 'строгий (только по теме)'}\n"
             f"Подпись внизу: {p.get('footer') or 'нет'}\n"
             f"Статус: {'включён' if p.get('enabled', True) else 'выключен'}")
     return text, [
         [("📥 Источники", f"sl:{pid}"), ("🎯 Куда", f"pe:{pid}:target")],
         [("🔁 Режим", f"pm:{pid}"), ("✍️ ИИ вкл/выкл", f"pr:{pid}")],
         [("🔢 Постов за запуск", f"pe:{pid}:per_run"), ("🏷 Тема", f"pe:{pid}:topic")],
+        [("🧹 Фильтр строгий/мягкий", f"pf:{pid}")],
         [("🧾 Подпись внизу", f"pe:{pid}:footer"), ("📝 Название", f"pe:{pid}:title")],
         [("⏯ Вкл/выкл", f"pt:{pid}"), ("🗑 Удалить канал", f"pd:{pid}")],
         [("⬅️ К списку", "l")]]
@@ -481,6 +483,10 @@ def on_callback(ctx, chat, mid, data):
         return show(ctx, chat, mid, v_profile(cfg, pid))
     if c == "pr":
         prof["rewrite"] = "keep" if prof.get("rewrite", "ai") == "ai" else "ai"
+        ctx.changed = True
+        return show(ctx, chat, mid, v_profile(cfg, pid))
+    if c == "pf":
+        prof["filter"] = "strict" if prof.get("filter") == "soft" else "soft"
         ctx.changed = True
         return show(ctx, chat, mid, v_profile(cfg, pid))
     if c == "pt":
