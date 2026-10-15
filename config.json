@@ -113,7 +113,8 @@
      "only_video": true,
      "from_id": 0
     }
-   ]
+   ],
+   "filter": "soft"
   }
  }
 }
