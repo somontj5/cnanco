@@ -118,6 +118,18 @@
      "sig": "Слова Лололошки",
      "only_video": false,
      "from_id": 0
+    },
+    {
+     "id": "@NIO_CHOM",
+     "sig": "от: Художник Лололошки",
+     "only_video": false,
+     "from_id": 0
+    },
+    {
+     "id": "@MrLololoshka_EDIT",
+     "sig": "от: Фанат №1",
+     "only_video": false,
+     "from_id": 0
     }
    ],
    "filter": "soft"
