@@ -1,10 +1,8 @@
 {
  "await": {
   "8755398440": {
-   "kind": "edit",
-   "pid": "chlololoshkafa",
-   "field": "from_id",
-   "src": "@LololoshkaUSE"
+   "kind": "add_source",
+   "pid": "chlololoshkaus"
   }
  },
  "admin": 8755398440

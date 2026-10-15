@@ -121,6 +121,19 @@
     }
    ],
    "filter": "soft"
+  },
+  "chlololoshkaus": {
+   "title": "Лололошка ФУ НОВОСТИ",
+   "target": "@LololoshkaUSE",
+   "footer": "",
+   "topic": "",
+   "mode": "new",
+   "rewrite": "ai",
+   "per_run": 10,
+   "first_run_hours": 999,
+   "state_file": "state_chlololoshkaus.json",
+   "enabled": true,
+   "sources": []
   }
  }
 }
