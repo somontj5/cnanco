@@ -102,18 +102,6 @@
    "enabled": true,
    "sources": [
     {
-     "id": "@montazh1230",
-     "sig": "монтажер пишет",
-     "only_video": false,
-     "from_id": 0
-    },
-    {
-     "id": "@videolo9090",
-     "sig": "",
-     "only_video": true,
-     "from_id": 0
-    },
-    {
      "id": "@LololoshkaUSE",
      "sig": "Слова Лололошки",
      "only_video": false,
