@@ -32,10 +32,14 @@ if CC.get("voice"):
     S.GEMINI_VOICE = CC["voice"]                                    # Puck, Fenrir, Charon, Kore, Leda...
 OUTRO = CC.get("outro") or "Скачать этот мод можно в моём Телеграм-канале."   # фраза в конце каждого ролика
 STORY = CC.get("story", True)                                       # один связный ролик: вступление с объяснением мода + несколько моментов обзора
+ACTION_CUT = CC.get("action_cut", True)                             # ИИ-деконструктор: разбивает видео по сменам кадра/действий, пишет сценарий и собирает динамичную нарезку
+PUBLISH_TG_CHANNEL = CC.get("publish_tg", False)                    # выкладывать готовую нарезку сразу в основной Telegram-канал (TARGET), а не только в Избранное
 TOTAL_MAX = min(170, int(CC.get("max_total") or 75))                # максимум длины связного ролика, сек (Shorts до 3 минут)
 TOTAL_CAP = 175.0
 PARTS = max(2, min(5, int(CC.get("parts") or 3)))                   # из скольких моментов собирать ролик
 PART_MIN, PART_MAX = 8, 30                                          # длина одного момента, сек
+ACTION_BEATS = max(4, min(10, int(CC.get("action_beats") or 6)))    # сколько динамичных сцен/действий собирать в режиме ИИ-деконструктора
+BEAT_MIN, BEAT_MAX = 3.5, 11.0                                      # длина одного действия/сцены в динамичной нарезке, сек
 OUTRO_SUB = "Скачать мод можно в моём Telegram-канале"
 TITLE_FMT = CC.get("title_fmt") or "Обзор мода «{mod}» на телефон"
 CHARS_PER_SEC = 15                                                  # сколько русских символов диктор произносит за секунду
@@ -489,8 +493,8 @@ def cta_overlay(path):
     return CTA_Y - 4
 
 
-def render(src, clip, sub_cues, out, dub=None):
-    """Вертикальный ролик 1080x1920: размытый фон, видео по центру, заголовок, субтитры, плашка внизу."""
+def render(src, clip, sub_cues, out, dub=None, sfx_events=None):
+    """Вертикальный ролик 1080x1920: размытый фон, видео по центру, заголовок, полоса прогресса, субтитры, плашка внизу."""
     st, en = clip["start"], clip["end"]
     dur = en - st
     ty = title_overlay(clip["title"], f"{WORK}/title.png")
@@ -500,43 +504,61 @@ def render(src, clip, sub_cues, out, dub=None):
         a, b = max(0.0, a - st), min(dur, b - st)
         if b - a < 0.3:
             continue
-        chunks = S.sub_chunks(text, max_words=6, max_chars=38)
+        chunks = S.sub_chunks(text, max_words=5, max_chars=34)
         weights = [len(c) + 2 for c in chunks]
         t = a
-        for c, w in zip(chunks, weights):
+        for ci, (c, w) in enumerate(zip(chunks, weights)):
             d_ = (b - a) * w / sum(weights)
             png = f"{WORK}/sub{len(subs)}.png"
-            S.draw_sub(c, png)
+            S.draw_sub(c, png, highlight=(ci == 0 and k == 0))
             subs.append((png, t, t + d_))
             t += d_
     cmd = ["ffmpeg", "-y", "-ss", f"{st:.2f}", "-t", f"{dur:.2f}", "-i", src,
            "-loop", "1", "-t", f"{dur:.2f}", "-i", f"{WORK}/title.png",
-           "-loop", "1", "-t", f"{dur:.2f}", "-i", f"{WORK}/cta.png"]
+           "-loop", "1", "-t", f"{dur:.2f}", "-i", f"{WORK}/cta.png",
+           "-f", "lavfi", "-i", f"color=c=0xFFC400:s={S.W}x10:r=30:d={dur + 1:.2f}"]
     for png, a, b in subs:
         cmd += ["-loop", "1", "-t", f"{dur:.2f}", "-i", png]
     if dub:
         cmd += ["-i", dub]
+    sfx_list = [(max(0.0, t), kind) for t, kind in (sfx_events or []) if 0 <= t < dur] if S.SFX_ON else []
+    for _, kind in sfx_list:
+        cmd += ["-i", S.sfx_file(kind)]
     fc = [f"[0:v]split=2[a][b]",
           # фон: размываем маленькую копию и растягиваем (в разы быстрее, чем размывать полный кадр)
           f"[a]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,boxblur=6:2,scale={S.W}:{S.H},eq=brightness=-0.18[bg]",
           f"[b]scale={S.W}:-2[fg]",
           "[bg][fg]overlay=(W-w)/2:(H-h)/2[v0]",
-          f"[v0][1:v]overlay=0:{ty}[v1]", f"[v1][2:v]overlay=0:{cy}[v2]"]
-    cur = "[v2]"
+          f"[v0][1:v]overlay=0:{ty}[v1]", f"[v1][2:v]overlay=0:{cy}[v2]",
+          f"[v2]drawbox=x=0:y={S.BAR_Y}:w={S.W}:h=10:color=white@0.28:t=fill[vb0]",
+          f"[vb0][3:v]overlay=x='-w+w*t/{dur:.3f}':y={S.BAR_Y}[vb1]"]
+    cur = "[vb1]"
     for j, (png, a, b) in enumerate(subs):
         nxt = f"[s{j}]"
-        fc.append(f"{cur}[{3 + j}:v]overlay=0:{SUB_Y}:enable='between(t,{a:.2f},{b:.2f})'{nxt}")
+        fc.append(f"{cur}[{4 + j}:v]overlay=0:{SUB_Y}:enable='between(t,{a:.2f},{b:.2f})'{nxt}")
         cur = nxt
     fc.append(f"{cur}format=yuv420p[vout]")
     if dub:
-        k = 3 + len(subs)
+        k = 4 + len(subs)
+        sfx_base = k + 1
+        amix_inputs = []
         if has_audio(src):       # оригинал приглушается, когда говорит диктор, и возвращается в паузах
             fc += [f"[{k}:a]asplit=2[dv][dk]",
                    f"[0:a:0]volume={ORIG_VOL}[oa]",
-                   "[oa][dk]sidechaincompress=threshold=0.02:ratio=14:attack=10:release=350[du]",
-                   "[du][dv]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-16:TP=-1.5:LRA=11[aout]"]
+                   "[oa][dk]sidechaincompress=threshold=0.02:ratio=14:attack=10:release=350[du]"]
+            amix_inputs += ["[du]", "[dv]"]
         else:
-            fc.append(f"[{k}:a]loudnorm=I=-16:TP=-1.5:LRA=11[aout]")
+            amix_inputs += [f"[{k}:a]"]
+        for si, (t_sfx, _) in enumerate(sfx_list):
+            s_idx = sfx_base + si
+            fc.append(f"[{s_idx}:a]aresample=44100,aformat=channel_layouts=mono,"
+                      f"adelay={int(t_sfx * 1000)}:all=1,volume={S.SFX_VOL * 0.75:.2f}[sfx{si}]")
+            amix_inputs.append(f"[sfx{si}]")
+        if len(amix_inputs) == 1:
+            fc.append(f"{amix_inputs[0]}loudnorm=I=-16:TP=-1.5:LRA=11[aout]")
+        else:
+            fc.append("".join(amix_inputs) +
+                      f"amix=inputs={len(amix_inputs)}:duration=first:normalize=0,loudnorm=I=-16:TP=-1.5:LRA=11[aout]")
         amap, af = ["-map", "[aout]"], []
     else:
         amap, af = ["-map", "0:a:0?"], ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"]
@@ -546,7 +568,11 @@ def render(src, clip, sub_cues, out, dub=None):
 
 
 def description(video, clip):
+    cq = f"💬 {clip['comment_q']}\n\n" if clip.get("comment_q") else ""
+    actions = f"Что показано в ролике:\n{clip['actions_log']}\n\n" if clip.get("actions_log") else ""
     return (f"{clip['yt_title']}\n\n"
+            f"{cq}"
+            f"{actions}"
             f"Оригинальное видео: https://youtu.be/{video['id']}\n"
             f"Автор: {AUTHOR} ({CREDIT}). Нарезка опубликована с разрешения автора."
             + (" Русская озвучка." if clip.get("dubbed") else "") + "\n\n"
@@ -554,7 +580,213 @@ def description(video, clip):
             "#Shorts #Minecraft #MinecraftBedrock")
 
 
-# ---------- связный ролик: вступление + несколько моментов ----------
+# ---------- ИИ-деконструктор: разбор каждого нового действия / смены кадра + сценарий + авто-нарезка ----------
+
+def detect_scene_changes(src, duration, threshold=0.32):
+    """Находит реальные визуальные смены кадра / склейки в видео через фильтр scdet в ffmpeg."""
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-v", "info", "-i", src,
+             "-vf", f"scale=160:90,fps=5,scdet=s=1:t={threshold * 100:.0f}",
+             "-an", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=180
+        )
+        out = []
+        for m in re.finditer(r"lavfi\.scd\.time:\s*(\d+(?:\.\d+)?)", r.stderr or ""):
+            t = float(m.group(1))
+            if 1.0 < t < duration - 1.0 and (not out or t - out[-1] >= 2.0):
+                out.append(round(t, 1))
+        return out[:120]
+    except Exception as e:
+        print(f"  scdet (поиск склеек): {e}")
+        return []
+
+
+def plan_action_cut(video, src, cues, duration):
+    """ИИ-деконструктор длинного ролика:
+    1) Получает смысл видео, субтитры и точки визуальных смен кадра (или вставки новых действий).
+    2) Выбирает серию ярких действий (action beats), пишет описание каждого нового действия в кадре
+       и связный авторский сценарий поверх них (hook -> серия действий -> байт на комменты / финал).
+    3) Возвращает готовый монтажный лист (storyboard) для сборки вирусного Shorts."""
+    info = analyze_video(video, cues, duration)
+    if not info:
+        return None
+    cuts = detect_scene_changes(src, duration)
+    rev = [x for x in info["sections"] if x["kind"] == "review"]
+    lines = [f"[{int(a)}] {t[:150]}" for a, b, t in cues if any(x["start"] - 1 <= a <= x["end"] + 1 for x in rev)]
+    outline = "\n".join(f"- {x['start']:.0f}-{x['end']:.0f} с ({x['kind']}): {x['what']}" for x in info["sections"])
+    cuts_str = ", ".join(f"{c:.0f}с" for c in cuts[:80]) if cuts else "ориентируйся по таймкодам субтитров"
+    budget = max(28, min(56, TOTAL_MAX - 8))
+
+    prompt = (
+        f"Ты топовый ИИ-режиссёр и сценарист вирусных YouTube Shorts про Minecraft Bedrock.\n"
+        f"Длинное видео автора {AUTHOR}: «{video['title']}» (длина {duration:.0f} с).\n"
+        f"Общий смысл: {info['summary']}\n"
+        f"Разделы видео:\n{outline}\n"
+        f"Точки визуальных смен кадра / новых вставок (секунды): {cuts_str}\n\n"
+        f"ЗАДАЧА: Разбери видео по сменам действий/кадров и собери из него ОДИН сверхдинамичный сценарий-нарезку "
+        f"из {ACTION_BEATS} лучших моментов (beats) ТОЛЬКО из разделов review.\n"
+        f"Каждый момент — это конкретное новое действие в кадре (смена сцены, показ новой способности, крафта, "
+        f"оружия, моба, взрыва или теста механики) длиной {BEAT_MIN:.0f}-{BEAT_MAX:.0f} секунд (в сумме все куски до {budget} сек).\n\n"
+        "Для КАЖДОГО выбранного действия напиши:\n"
+        "- start, end: точные секунды начала и конца действия в исходном видео (по смене кадра и началу мысли, без пересечений);\n"
+        "- action_desc: короткое описание того, что визуально меняется/происходит в кадре (на русском, до 70 симв., для лога и монтажа);\n"
+        "- ru: живая, цепляющая фраза для субтитров на экране (сразу к сути того, что происходит в кадре, сохраняя англ. названия модов);\n"
+        "- say: та же фраза для диктора (все английские слова и названия записаны русскими буквами как произносятся, числа словами).\n"
+        "ВАЖНО: первый же момент или вступление (hook_ru / hook_say) должен начинаться с мощного хука на удержание "
+        "(интрига, шок-эффект или боль игрока, без «привет» и «сегодня посмотрим»). Все фразы beats должны складываться "
+        "в единый динамичный рассказ с нарастанием до самого крутого момента в конце!\n"
+        "Добавь hook_ru и hook_say (1 яркое предложение на 3-5 секунд для заставки-вступления) и "
+        "comment_q (короткий вопрос зрителям для байта на комментарии в описании).\n"
+        'Верни ТОЛЬКО JSON:\n'
+        '{"hook_ru": "...", "hook_say": "...", "comment_q": "...", '
+        '"beats": [{"start": сек, "end": сек, "action_desc": "...", "ru": "...", "say": "..."}]}\n\n'
+        "Субтитры частей review:\n" + "\n".join(lines)[:90000]
+    )
+
+    def check(d):
+        good, last_end, total = [], -1.0, 0.0
+        try:
+            for b in sorted(d["beats"], key=lambda x: float(x["start"])):
+                st, en = float(b["start"]), float(b["end"])
+                if en - st > BEAT_MAX + 3:
+                    en = st + BEAT_MAX
+                if en - st < BEAT_MIN - 0.5:
+                    en = min(duration - 0.5, st + BEAT_MIN + 1.0)
+                if st < 0 or en > duration + 0.5 or en - st < BEAT_MIN - 0.5 or st < last_end:
+                    continue
+                if _review_share(info, st, en) < 0.55 or total + (en - st) > budget + 8:
+                    continue
+                ru_txt = str(b.get("ru") or "").strip()
+                say_txt = str(b.get("say") or ru_txt).strip()
+                if not ru_txt:
+                    continue
+                good.append(dict(
+                    start=round(st, 2),
+                    end=round(en, 2),
+                    action_desc=str(b.get("action_desc") or "Смена действия в кадре").strip()[:90],
+                    ru=ru_txt[:220],
+                    say=say_txt[:250]
+                ))
+                last_end, total = en, total + (en - st)
+        except Exception:
+            return False
+        d["beats"] = good[:ACTION_BEATS]
+        return len(d["beats"]) >= 2
+
+    res = S.gemini_raw(prompt, check)
+    if not res:
+        return None
+    mod = info.get("mod_name")
+    title = TITLE_FMT.format(mod=mod) if mod else video["title"][:45]
+    hook_ru = str(res.get("hook_ru") or info.get("intro_ru") or "").strip()[:220]
+    hook_say = str(res.get("hook_say") or info.get("intro_say") or hook_ru).strip()[:260]
+    intro_start = min((x["start"] for x in info["sections"] if x["kind"] == "intro"), default=res["beats"][0]["start"])
+    print(f"  [ИИ-деконструктор] Собрано действий: {len(res['beats'])}, визуальных склеек найдено: {len(cuts)}")
+    for idx, b in enumerate(res["beats"], 1):
+        print(f"    Кадр {idx} ({b['start']:.1f}-{b['end']:.1f}с): {b['action_desc']} -> «{b['ru'][:70]}»")
+    return dict(
+        beats=res["beats"],
+        mod=mod,
+        title=title,
+        summary=info["summary"],
+        hook_ru=hook_ru,
+        hook_say=hook_say,
+        intro_start=intro_start,
+        comment_q=str(res.get("comment_q") or "Какая фишка мода топовая? Напиши в комментариях!").strip()[:140],
+        yt_title=(f"{title} | Minecraft Bedrock" if mod else video["title"])[:95]
+    )
+
+
+async def build_action_cut(video, src, duration, plan, tag):
+    """Собирает динамичную ИИ-нарезку по сменам действий (action_cut):
+    Каждое новое действие в кадре синхронизируется с соответствующей репликой сценария,
+    на стыках действий ставятся звуковые переходы (whoosh/pop), полоса удержания и динамические субтитры."""
+    beats = plan["beats"]
+    has_hook = bool(plan.get("hook_say"))
+    outro_say = "Какая фишка понравилась больше? Напиши в комментариях! А скачать этот мод можно в моём Телеграм-канале."
+    say_list = ([plan["hook_say"]] if has_hook else []) + [b["say"] for b in beats] + [outro_say]
+    ru_list = ([plan["hook_ru"]] if has_hook else []) + [b["ru"] for b in beats] + [OUTRO_SUB]
+
+    tts = await synth(say_list)
+    if not tts:
+        return None
+
+    pieces = []          # [(start_in_src, dur_in_src, mute)]
+    dub_items = []       # [(start_on_timeline, real_dur, tempo, wav_file)]
+    sub_cues = []        # [(start, end, text)]
+    sfx_events = []      # [(time, kind)]
+    cursor = 0.0
+
+    # 1. Вступление-хук (берём яркий кадр первого действия или интро)
+    idx = 0
+    if has_hook:
+        d, f = tts[0]
+        idx = 1
+        tempo = min(MAX_TEMPO, d / 7.5) if d > 7.5 else 1.0
+        real = d / tempo
+        seg_dur = max(2.2, real + 0.35)
+        st_src = max(0.0, min(plan["intro_start"], duration - seg_dur - 0.2))
+        pieces.append((st_src, seg_dur, True))
+        dub_items.append((0.1, real, tempo, f))
+        if SUBS:
+            sub_cues.append((0.1, 0.1 + real, plan["hook_ru"]))
+        sfx_events.append((0.05, "hit"))
+        cursor += seg_dur
+
+    # 2. Каждое действие (action beat) подгоняем под длину фразы диктора или кадр видео
+    for bi, b in enumerate(beats):
+        d, f = tts[idx + bi]
+        raw_dur = b["end"] - b["start"]
+        # Если фраза диктора чуть длиннее куска видео — слегка ускоряем речь и чуть продлеваем кусок видео
+        target_dur = max(BEAT_MIN, min(BEAT_MAX + 2.0, max(raw_dur, d / 1.22 + 0.3)))
+        if b["start"] + target_dur > duration - 0.1:
+            target_dur = max(2.0, duration - 0.1 - b["start"])
+        slot = max(1.2, target_dur - 0.2)
+        tempo = min(MAX_TEMPO, d / slot) if d > slot else 1.0
+        real = d / tempo
+        actual_seg = max(real + 0.28, min(raw_dur, target_dur))
+        pieces.append((b["start"], actual_seg, False))
+        dub_items.append((cursor + 0.08, real, tempo, f))
+        if SUBS:
+            sub_cues.append((cursor + 0.08, cursor + 0.08 + real, b["ru"]))
+        sfx_events.append((max(0.0, cursor - 0.04), "whoosh" if bi % 2 == 0 else "pop"))
+        cursor += actual_seg
+
+    # 3. Финальный призыв + вопрос на комменты (продолжаем последний кадр действия)
+    d_out, f_out = tts[-1]
+    tempo_out = min(MAX_TEMPO, d_out / 5.5) if d_out > 5.5 else 1.0
+    real_out = d_out / tempo_out
+    outro_seg = real_out + 0.45
+    last_b = beats[-1]
+    outro_st = min(duration - outro_seg - 0.1, last_b["start"] + (pieces[-1][1] if pieces else 0.0))
+    if outro_st < 0:
+        outro_st = max(0.0, last_b["start"])
+    pieces.append((outro_st, outro_seg, False))
+    dub_items.append((cursor + 0.08, real_out, tempo_out, f_out))
+    if SUBS:
+        sub_cues.append((cursor + 0.08, cursor + 0.08 + real_out, OUTRO_SUB))
+    sfx_events.append((cursor + 0.05, "ding"))
+    total = min(TOTAL_CAP, cursor + outro_seg)
+
+    asm = f"{WORK}/action_src.mp4"
+    assemble(src, pieces, asm)
+    dub = f"{WORK}/dub_action.wav"
+    mix_dub(dub_items, total, dub)
+
+    actions_log = "\n".join(f"• {b['action_desc']}" for b in beats)
+    clip = dict(
+        start=0.0,
+        end=total,
+        title=plan["title"],
+        yt_title=plan["yt_title"],
+        dubbed=True,
+        comment_q=plan.get("comment_q", ""),
+        actions_log=actions_log
+    )
+    out = f"{WORK}/action_cut.mp4"
+    render(asm, clip, sub_cues, out, dub, sfx_events=sfx_events)
+    return out, clip
 
 def pick_story(video, info, cues, duration):
     """Gemini выбирает 2-N моментов из частей обзора, которые вместе рассказывают про мод. Возвращает [{start,end}] или None."""
@@ -783,18 +1015,27 @@ async def main():
             cues = parse_vtt(vtt) if vtt else []
             failed = False
             reel_done = False
-            story = plan_story(video, cues, duration) if (STORY and DUB and SMART and cues) else None
-            if story:                                   # связный ролик: вступление + моменты + финальная фраза
-                reel = await build_story(video, src, cues, duration, story, tag)
-                if reel:
-                    out, clip = reel
-                    results.append((out, clip, upload(video, out, clip, tag)))
-                    reel_done = True
-                elif REQUIRE_DUB:
-                    print(tag, "связный ролик не собрался (озвучка Gemini TTS или перевод), повторю в следующий запуск")
-                    failed = True
-                else:
-                    print(tag, "связный ролик не собрался, делаю обычные нарезки")
+            if ACTION_CUT and DUB and SMART and cues:
+                ac_plan = plan_action_cut(video, src, cues, duration)
+                if ac_plan:
+                    reel = await build_action_cut(video, src, duration, ac_plan, tag)
+                    if reel:
+                        out, clip = reel
+                        results.append((out, clip, upload(video, out, clip, tag)))
+                        reel_done = True
+            if not reel_done:
+                story = plan_story(video, cues, duration) if (STORY and DUB and SMART and cues) else None
+                if story:                                   # связный ролик: вступление + моменты + финальная фраза
+                    reel = await build_story(video, src, cues, duration, story, tag)
+                    if reel:
+                        out, clip = reel
+                        results.append((out, clip, upload(video, out, clip, tag)))
+                        reel_done = True
+                    elif REQUIRE_DUB:
+                        print(tag, "связный ролик не собрался (озвучка Gemini TTS или перевод), повторю в следующий запуск")
+                        failed = True
+                    else:
+                        print(tag, "связный ролик не собрался, делаю обычные нарезки")
             if not reel_done and not failed:
                 failed = await legacy_clips(video, src, cues, duration, tag, results)
             if not failed or results:                  # если озвучка не вышла у первой же нарезки, видео попробуем снова
@@ -809,9 +1050,18 @@ async def main():
         async with S.TelegramClient(S.StringSession(S.SESSION), S.API_ID, S.API_HASH) as client:
             for out, clip, link in results:
                 head = f"YouTube: {link}\n\n" if link else "Загрузи вручную:\n\n"
-                await client.send_file(S.SHORTS_CHAT, out, caption=(head + clip["yt_title"])[:1024],
-                                       attributes=[S.DocumentAttributeVideo(duration=int(clip["end"] - clip["start"]),
-                                                                            w=S.W, h=S.H, supports_streaming=True)])
+                actions_info = f"\n\n🎬 Разбор сцен:\n{clip['actions_log']}" if clip.get("actions_log") else ""
+                cap = (head + clip["yt_title"] + actions_info)[:1024]
+                attrs = [S.DocumentAttributeVideo(duration=int(clip["end"] - clip["start"]),
+                                                  w=S.W, h=S.H, supports_streaming=True)]
+                await client.send_file(S.SHORTS_CHAT, out, caption=cap, attributes=attrs)
+                if PUBLISH_TG_CHANNEL and S.TARGET and str(S.TARGET) != str(S.SHORTS_CHAT):
+                    try:
+                        tg_cap = f"🔥 {clip['title']}\n\n{clip.get('actions_log') or ''}\n\n📥 Скачать мод в нашем канале: {S.HANDLE or S.TARGET}".strip()[:1024]
+                        await client.send_file(S.TARGET, out, caption=tg_cap, attributes=attrs)
+                        print("  опубликовано в основной Telegram-канал:", S.TARGET)
+                    except Exception as e:
+                        print("  ошибка публикации в основной канал:", e)
     print("Готово, нарезок:", len(results))
 
 
