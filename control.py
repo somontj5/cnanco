@@ -217,12 +217,18 @@ def v_clips(cfg):
     text = ("✂️ Нарезки из чужого YouTube-канала (с разрешения автора)\n"
             f"Канал: {c.get('author') or 'ECKOSOLDIER'} ({c.get('channel_id') or 'UCkjxZqW8zRi4rexA3TMvmrA'})\n"
             f"Подпись автора на ролике: {c.get('credit') or '@ecko'}\n"
-            f"Нарезок из одного видео: {c.get('per_video') or 2}\n"
+            f"ИИ-деконструктор по сменам действий: {'да' if c.get('action_cut', True) else 'нет'}\n"
+            f"Сцен/действий в ИИ-нарезке: {c.get('action_beats') or 6}\n"
+            f"Нарезок из одного видео (обычный режим): {c.get('per_video') or 2}\n"
             f"Русские субтитры: {'да' if c.get('subs', True) else 'нет'}\n"
+            f"Выкладывать также в TG-канал: {'да' if c.get('publish_tg', False) else 'нет'}\n"
             f"Статус: {'включено' if c.get('enabled', True) else 'выключено'}")
     return text, [
         [("📺 Канал YouTube", "cle:channel"), ("🏷 Подпись автора", "cle:credit")],
+        [(f"🎬 ИИ-разбор действий: {'да' if c.get('action_cut', True) else 'нет'}", "cla"),
+         (f"⚡ Сцен: {c.get('action_beats') or 6}", "clb")],
         [(f"🔢 Нарезок: {c.get('per_video') or 2}", "clp"), (f"💬 Субтитры: {'да' if c.get('subs', True) else 'нет'}", "clv")],
+        [(f"📢 Пост в TG-канал: {'да' if c.get('publish_tg', False) else 'нет'}", "clt")],
         [("⏯ Вкл/выкл", "cln"), ("▶️ Запустить сейчас", "clr")],
         [("⬅️ Меню", "m")]]
 
@@ -435,6 +441,23 @@ def on_callback(ctx, chat, mid, data):
     if c == "clp":
         cc = cfg.setdefault("clips", {})
         cc["per_video"] = (cc.get("per_video") or 2) % 3 + 1
+        ctx.changed = True
+        return show(ctx, chat, mid, v_clips(cfg))
+    if c == "cla":
+        cc = cfg.setdefault("clips", {})
+        cc["action_cut"] = not cc.get("action_cut", True)
+        ctx.changed = True
+        return show(ctx, chat, mid, v_clips(cfg))
+    if c == "clb":
+        cc = cfg.setdefault("clips", {})
+        beats_opts = [4, 5, 6, 7, 8]
+        cur_b = cc.get("action_beats") or 6
+        cc["action_beats"] = beats_opts[(beats_opts.index(cur_b) + 1) % len(beats_opts)] if cur_b in beats_opts else 6
+        ctx.changed = True
+        return show(ctx, chat, mid, v_clips(cfg))
+    if c == "clt":
+        cc = cfg.setdefault("clips", {})
+        cc["publish_tg"] = not cc.get("publish_tg", False)
         ctx.changed = True
         return show(ctx, chat, mid, v_clips(cfg))
     if c == "clv":

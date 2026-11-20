@@ -49,12 +49,15 @@ SWAP_AT = 0.5                                     # на какой доле ф�
 MUSIC_VOL_PLAIN = 0.60                            # громкость музыки, если голоса нет
 
 # --- монтаж ---
-TRANSITION = 0.30        # длительность перехода между сценами, сек
-PAUSE = 0.12             # пауза после фразы, сек
-FALLBACK_DUR = {"hook": 2.8, "bullet": 3.6, "cta": 3.0}   # длительность сцен, если голоса нет
+TRANSITION = 0.25        # длительность перехода между сценами, сек (быстрее для лучшего удержания)
+PAUSE = 0.08             # короткая пауза после фразы, сек (динамичный ритм без провисаний)
+FALLBACK_DUR = {"hook": 2.4, "bullet": 3.2, "cta": 2.6}   # длительность сцен, если голоса нет
 XFADES = ["fade", "slideleft", "slideright", "smoothleft", "smoothright", "wipeleft", "circleopen", "dissolve"]
 MOTIONS = ["in", "left", "out", "up"]             # движение камеры по сценам по кругу
 BAR_Y = 160              # где рисуется полоска прогресса
+SUB_ON_HOOK = True       # показывать динамические субтитры даже на хуке (для тех, кто смотрит без звука)
+LOOP_CTA = True          # бесшовная закольцовка (loop): концовка плавно переходит обратно в хук
+PIN_COMMENT_HINT = True  # байт на комментарии в описании и озвучке для буста алгоритмов YouTube
 
 # --- оформление карточки ---
 TITLE_FONT = "Montserrat:bold"      # шрифт заголовка: «семейство:начертание»
@@ -121,26 +124,25 @@ def script_prompt(label, k, per_item, posts_text):
         f"пролистывать. Цель: чтобы зритель захотел СРАЗУ скачать и попробовать. {task} "
         "Факты бери только из текстов постов, ничего не выдумывай, но подавай их ярко и конкретно.\n\n"
 
-        "СЦЕНАРНОЕ МАСТЕРСТВО:\n"
-        "• Зацепка (hook) работает на любопытство: обещай результат, но не раскрывай, как. "
-        "Рабочие приёмы: боль зрителя («Надоело, что ночью везде мобы?»), контраст до и после, "
-        "число плюс обещание, неожиданный факт, прямое обращение на «ты». "
+        "СЦЕНАРНОЕ МАСТЕРСТВО И ВИРУСНОЕ УДЕРЖАНИЕ (чтобы пробить 10k-100k просмотров):\n"
+        "• Зацепка (hook) работает на стоп-скролл в первые 1.5 секунды: удар по боли игрока, резкий контраст, "
+        "запретный приём («Секрет, который скрывают...», «С этим выживание превращается в...») или интрига. "
+        "Обещай результат, но не раскрывай весь секрет сразу — оставь открытую петлю (open loop) до конца ролика! "
         f"Примеры уровня: {hook_example}. "
-        "Проверка: если после этой фразы хочется узнать продолжение, она годится.\n"
+        "Проверка: если после этой фразы хочется досмотреть до 3-го пункта, она годится.\n"
         "• ЗАПРЕЩЕНЫ штампы: «полностью изменят», «изменит твой Майнкрафт», «топ», «лучшие», "
         "«ты не поверишь», «это нужно видеть», «новые возможности», «улучшает геймплей».\n"
         "• Конкретика вместо общих слов: один яркий образ на пункт, сильный глагол, число или название "
         "из текста. Не «новые предметы», а «посох, который бьёт молнией по всем мобам в радиусе».\n"
         "• Выгода игроку: каждый пункт отвечает «что я смогу делать, чего не мог раньше» "
         "(быстрее строить, выживать, побеждать, удивлять друзей).\n"
-        "• Нарастание: в подборке каждый следующий пост подаётся эффектнее предыдущего. "
-        "Для связки используй разные короткие переходы («Второй…», «Дальше — …», «И напоследок…»), "
-        "не повторяй один и тот же.\n"
-        "• Ритм для озвучки: короткие предложения до 12 слов, разговорная речь как другу, "
+        "• Нарастание и удержание: в подборке самый мощный и безумный пункт ставь ПОСЛЕДНИМ, а в переходе к нему "
+        "подогревай интерес («Но последний мод — вообще имба...», «А вот третье ломает физику...»).\n"
+        "• Ритм для озвучки: короткие рубленые предложения до 12 слов, разговорная речь как другу, "
         "без канцелярита («данный», «осуществляет», «предоставляет»), не начинай соседние фразы "
         "одним и тем же словом, не повторяй слова подряд.\n"
-        "• Последняя фраза последнего поста даёт сильный финал, призыв скачать озвучивается "
-        "отдельно, поэтому его не пиши.\n\n"
+        "• Вовлечение в комментарии (байт алгоритмов): добавь короткий вопрос зрителям в поле comment_question "
+        "(например: «Какой мод заберёшь себе: 1, 2 или 3? Напиши в комментах!»).\n\n"
 
         "ТРЕБОВАНИЯ К ПОЛЯМ:\n"
         "1. hook: самая первая фраза ролика, до 9 слов, про ВСЮ подборку"
@@ -159,14 +161,16 @@ def script_prompt(label, k, per_item, posts_text):
         "(предмет, моб или постройка из текста). Это иллюстрации в стиле Minecraft, без текста и надписей.\n"
         "4. В hook и voice все иностранные слова пиши русскими буквами, как слышатся "
         "(Minecraft = Майнкрафт, Add-On = аддон).\n"
-        "5. yt_title: до 90 символов, цепляющий, с числом или интригой и словом Minecraft, без обмана.\n\n"
+        "5. yt_title: до 85 символов, максимально кликабельный (высокий CTR), с интригой и словом Minecraft.\n"
+        "6. comment_question: короткий вопрос на 6-10 слов для байта на комментарии в описании.\n\n"
 
         "Верни ТОЛЬКО JSON без пояснений:\n"
         '{"hook": "...",\n'
         ' "items": [{"name": "...", "bullets": ["..."], "voice": ["..."], "art": ["..."]}],\n'
         ' "yt_title": "...",\n'
-        ' "yt_description": "2-3 предложения: что в подборке, призыв скачать бесплатно в Telegram, '
-        'ссылка в шапке канала; в конце хэштеги #Shorts #Minecraft и ещё 2-3 по теме"}\n\n'
+        ' "comment_question": "...",\n'
+        ' "yt_description": "2-3 предложения: что в подборке, вопрос для комментариев, призыв скачать бесплатно в Telegram, '
+        'ссылка в шапке канала; в конце хэштеги #Shorts #Minecraft #MinecraftBedrock и ещё 2-3 по теме"}\n\n'
         "Посты:\n" + posts_text
     )
 
@@ -200,6 +204,7 @@ def normalize_script(d):
             art=[x for x in _as_list(it.get("art") or it.get("images")) if str(x).strip()]))
     d["items"] = norm
     d["yt_title"] = d.get("yt_title") if isinstance(d.get("yt_title"), str) else ""
+    d["comment_question"] = d.get("comment_question") if isinstance(d.get("comment_question"), str) else ""
     d["yt_description"] = d.get("yt_description") if isinstance(d.get("yt_description"), str) else ""
     return d
 
@@ -665,15 +670,21 @@ def sub_chunks(text, max_words=3, max_chars=20):
     return chunks
 
 
-def draw_sub(text, out_png):
-    f = get_font("title", 54)
+def draw_sub(text, out_png, highlight=False):
+    f = get_font("title", 56)
     m = ImageDraw.Draw(Image.new("RGB", (10, 10)))
-    lines = wrap(m, text, f, W - 160)[:2]
-    lh = 68
-    im = Image.new("RGBA", (W, lh * len(lines) + 20), (0, 0, 0, 0))
+    lines = wrap(m, text, f, W - 140)[:2]
+    lh = 72
+    im = Image.new("RGBA", (W, lh * len(lines) + 28), (0, 0, 0, 0))
     d = ImageDraw.Draw(im)
+    # полупрозрачная тёмная подложка под текст для мгновенного считывания на любом фоне
+    max_lw = max((d.textlength(ln, font=f) for ln in lines), default=200)
+    bw = min(W - 80, int(max_lw) + 56)
+    bx = (W - bw) // 2
+    d.rounded_rectangle((bx, 4, bx + bw, lh * len(lines) + 24), radius=24, fill=(10, 10, 18, 175))
+    fill_col = ACCENT if highlight else "white"
     for i, ln in enumerate(lines):
-        d.text((W // 2, 10 + i * lh + lh // 2), ln, font=f, fill="white", anchor="mm",
+        d.text((W // 2, 14 + i * lh + lh // 2), ln, font=f, fill=fill_col, anchor="mm",
                stroke_width=7, stroke_fill="black")
     im.save(out_png)
     return im.size[1]
@@ -1379,8 +1390,10 @@ async def build_short(items, hook, out):
                              alt=it["imgs"][lst[1]] if len(lst) > 1 else None,
                              text=it["voices"][bi], soft=bi > 0))
     last = items[-1]
-    cta_text = ("Всё это бесплатно в Телеграме. Ссылка в шапке канала." if k > 1
-                else "Скачивай бесплатно в Телеграме. Ссылка в шапке канала.")
+    if k > 1:
+        cta_text = "Какой заберёшь: первый, второй или третий? Пиши в комментах, а скачать всё бесплатно можно в Телеграме по ссылке в шапке!"
+    else:
+        cta_text = "Как тебе этот мод? Оцени в комментариях, а скачать бесплатно можно в Телеграме по ссылке в шапке канала!"
     prev = plan[-1]
     plan.append(dict(kind="cta", item=k - 1, stage=len(last["bullets"]) + 1, L=last["L"],
                      img=prev["alt"] or prev["img"], alt=None, text=cta_text, soft=True))
@@ -1447,15 +1460,28 @@ async def build_short(items, hook, out):
     subs = []
     if voice_ok:
         for s in plan:
-            if s["kind"] != "bullet" or not s["voice_d"]:
+            if not s["voice_d"]:
+                continue
+            if s["kind"] == "hook" and SUB_ON_HOOK:
+                chunks = sub_chunks(s["text"], max_words=3, max_chars=22)
+                weights = [len(c) + 2 for c in chunks]
+                at = s["start"] + 0.05
+                for ci, (c, w) in enumerate(zip(chunks, weights)):
+                    dur = s["voice_d"] * w / sum(weights)
+                    png = f"{WORK}/sub{len(subs)}.png"
+                    h = draw_sub(c.upper(), png, highlight=(ci == len(chunks) - 1))
+                    subs.append(dict(png=png, a=at, b=at + dur, y=H - SAFE_BOTTOM - h - 20))
+                    at += dur
+                continue
+            if s["kind"] != "bullet":
                 continue
             chunks = sub_chunks(s["text"])
             weights = [len(c) + 2 for c in chunks]
             at = s["start"] + TRANSITION / 2
-            for c, w in zip(chunks, weights):
+            for ci, (c, w) in enumerate(zip(chunks, weights)):
                 dur = s["voice_d"] * w / sum(weights)
                 png = f"{WORK}/sub{len(subs)}.png"
-                h = draw_sub(c, png)
+                h = draw_sub(c, png, highlight=(ci == 0))
                 subs.append(dict(png=png, a=at, b=at + dur, y=s["L"]["photo_bottom"] - h - 16))
                 at += dur
 
@@ -1535,8 +1561,11 @@ async def main():
 
                     yt_title = (data.get("yt_title") or hook).strip()[:95]
                     yt_desc = (data.get("yt_description") or "").strip()
+                    cq = (data.get("comment_question") or "").strip()
+                    if cq and cq.lower() not in yt_desc.lower():
+                        yt_desc = f"💬 {cq}\n\n" + yt_desc
                     if "#shorts" not in yt_desc.lower():
-                        yt_desc += "\n#Shorts #Minecraft"
+                        yt_desc += "\n#Shorts #Minecraft #MinecraftBedrock"
 
                     yt_link = ""
                     if YT_ID and YT_SECRET and YT_REFRESH:
